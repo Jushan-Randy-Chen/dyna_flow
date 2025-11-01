@@ -14,6 +14,7 @@ import mujoco.viewer
 def quat_rotate_inverse_np(q, v):
     """
     Rotate vector by inverse of quaternion (numpy version).
+    Matches Genesis implementation for consistency.
     
     Args:
         q: quaternion (4,) [w, x, y, z]
@@ -22,12 +23,14 @@ def quat_rotate_inverse_np(q, v):
     Returns:
         rotated vector (3,)
     """
-    q_w = q[0]
-    q_vec = q[1:]
-    a = v * (2.0 * q_w ** 2 - 1.0)
-    b = np.cross(q_vec, v) * q_w * 2.0
-    c = q_vec * np.dot(q_vec, v) * 2.0
-    return a - b + c
+    # Inverse quaternion: [w, -x, -y, -z]
+    q_inv = np.array([q[0], -q[1], -q[2], -q[3]])
+    
+    # Apply quaternion rotation: v + 2*w*(qvec x v) + 2*(qvec x (qvec x v))
+    # This matches the Genesis torch implementation
+    qvec = q_inv[1:]  # [x, y, z]
+    t = np.cross(qvec, v) * 2
+    return v + q_inv[0] * t + np.cross(qvec, t)
 
 
 class Go2MuJoCoEnv:
@@ -222,13 +225,25 @@ class Go2MuJoCoEnv:
         return self.privileged_obs_buf
     
     def _update_state_buffers(self, env_ids: torch.Tensor):
-        """Update state buffers from MuJoCo data."""
+        """Update state buffers from MuJoCo data.
+        
+        CRITICAL: MuJoCo qvel stores velocities in WORLD frame.
+        We must transform them to BASE frame to match Genesis behavior.
+        """
         for idx in env_ids:
             i = idx.item()
             self.base_pos[i] = torch.tensor(self.mj_datas[i].qpos[:3], device=self.device)
             self.base_quat[i] = torch.tensor(self.mj_datas[i].qpos[3:7], device=self.device)
-            self.base_lin_vel[i] = torch.tensor(self.mj_datas[i].qvel[:3], device=self.device)
-            self.base_ang_vel[i] = torch.tensor(self.mj_datas[i].qvel[3:6], device=self.device)
+            
+            # Get world-frame velocities from MuJoCo
+            world_lin_vel = torch.tensor(self.mj_datas[i].qvel[:3], device=self.device)
+            world_ang_vel = torch.tensor(self.mj_datas[i].qvel[3:6], device=self.device)
+            
+            # Transform to base frame (matching Genesis: transform_by_quat(vel, inv_quat))
+            inv_base_quat = self._inv_quat(self.base_quat[i:i+1])
+            self.base_lin_vel[i] = self._transform_by_quat(world_lin_vel.unsqueeze(0), inv_base_quat).squeeze(0)
+            self.base_ang_vel[i] = self._transform_by_quat(world_ang_vel.unsqueeze(0), inv_base_quat).squeeze(0)
+            
             self.dof_pos[i] = torch.tensor(self.mj_datas[i].qpos[7:19], device=self.device)
             self.dof_vel[i] = torch.tensor(self.mj_datas[i].qvel[6:18], device=self.device)
     
@@ -321,11 +336,12 @@ class Go2MuJoCoEnv:
     
     def _check_termination(self):
         """Check termination conditions."""
-        # Roll and pitch termination
+        # Get Euler angles (in degrees, matching Genesis behavior)
         roll, pitch, _ = self._get_euler_from_quat(self.base_quat)
         
-        roll_term = torch.abs(roll) > np.deg2rad(self.env_cfg["termination_if_roll_greater_than"])
-        pitch_term = torch.abs(pitch) > np.deg2rad(self.env_cfg["termination_if_pitch_greater_than"])
+        # Config values are in degrees (same as Genesis)
+        roll_term = torch.abs(roll) > self.env_cfg["termination_if_roll_greater_than"]
+        pitch_term = torch.abs(pitch) > self.env_cfg["termination_if_pitch_greater_than"]
         
         # Time limit
         time_out = self.episode_length_buf >= self.max_episode_length
@@ -333,19 +349,70 @@ class Go2MuJoCoEnv:
         self.reset_buf = roll_term | pitch_term | time_out
     
     @staticmethod
+    def _inv_quat(quat):
+        """
+        Compute inverse of quaternion.
+        Matches Genesis implementation: [w, -x, -y, -z]
+        
+        Args:
+            quat: (N, 4) tensor [w, x, y, z]
+        Returns:
+            inverse quaternion (N, 4) [w, -x, -y, -z]
+        """
+        scaling = torch.tensor([1, -1, -1, -1], device=quat.device, dtype=quat.dtype)
+        return quat * scaling
+    
+    @staticmethod
+    def _transform_by_quat(v, quat):
+        """
+        Rotate vector by quaternion.
+        Matches Genesis torch implementation from geom.py:
+        
+        qvec = quat[..., 1:]
+        t = qvec.cross(v, dim=-1) * 2
+        return v + quat[..., :1] * t + qvec.cross(t, dim=-1)
+        
+        Args:
+            v: (N, 3) vector
+            quat: (N, 4) quaternion [w, x, y, z]
+        Returns:
+            rotated vector (N, 3)
+        """
+        qvec = quat[..., 1:]  # [x, y, z]
+        t = torch.cross(qvec, v, dim=-1) * 2
+        return v + quat[..., :1] * t + torch.cross(qvec, t, dim=-1)
+    
+    @staticmethod
     def _quat_rotate_inverse(q, v):
-        """Rotate vector by inverse of quaternion."""
-        q_w = q[:, 0]
-        q_vec = q[:, 1:]
-        a = v * (2.0 * q_w ** 2 - 1.0).unsqueeze(-1)
-        b = torch.cross(q_vec, v, dim=-1) * q_w.unsqueeze(-1) * 2.0
-        c = q_vec * torch.bmm(q_vec.view(q.shape[0], 1, 3), v.view(v.shape[0], 3, 1)).squeeze(-1) * 2.0
-        return a - b + c
+        """
+        Rotate vector by inverse of quaternion.
+        This is equivalent to: _transform_by_quat(v, _inv_quat(q))
+        
+        Args:
+            q: (N, 4) quaternion [w, x, y, z]
+            v: (N, 3) vector
+        Returns:
+            rotated vector (N, 3)
+        """
+        # Inverse quat is [w, -x, -y, -z]
+        inv_q = Go2MuJoCoEnv._inv_quat(q)
+        return Go2MuJoCoEnv._transform_by_quat(v, inv_q)
     
     @staticmethod
     def _get_euler_from_quat(quat):
-        """Convert quaternion to Euler angles (roll, pitch, yaw)."""
-        # quat: (N, 4) [w, x, y, z]
+        """
+        Convert quaternion to Euler angles (roll, pitch, yaw).
+        Returns angles in DEGREES to match Genesis behavior.
+        
+        Args:
+            quat: (N, 4) tensor [w, x, y, z]
+        
+        Returns:
+            roll, pitch, yaw: (N,) tensors for each angle in DEGREES
+        """
+        # For batched operations, we still use the manual implementation
+        # MuJoCo functions work on single quaternions, not batches
+        
         w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
         
         # Roll (x-axis rotation)
@@ -362,4 +429,6 @@ class Go2MuJoCoEnv:
         cosy_cosp = 1 - 2 * (y * y + z * z)
         yaw = torch.atan2(siny_cosp, cosy_cosp)
         
-        return roll, pitch, yaw
+        # Convert to degrees (matching Genesis quat_to_xyz behavior)
+        rad_to_deg = 180.0 / np.pi
+        return roll * rad_to_deg, pitch * rad_to_deg, yaw * rad_to_deg

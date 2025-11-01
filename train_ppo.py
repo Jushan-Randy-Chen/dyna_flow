@@ -180,7 +180,7 @@ def main():
     env_cfg, obs_cfg, reward_cfg, command_cfg = get_cfgs()
     train_cfg = get_train_cfg(args.exp_name, args.max_iterations, 
                                args.num_learning_epochs, args.num_steps_per_env)
-
+    
     # Clean up old logs if they exist
     if os.path.exists(log_dir):
         shutil.rmtree(log_dir)
