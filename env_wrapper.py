@@ -232,20 +232,21 @@ class Go2MuJoCoEnv:
         """
         for idx in env_ids:
             i = idx.item()
-            self.base_pos[i] = torch.tensor(self.mj_datas[i].qpos[:3], device=self.device)
-            self.base_quat[i] = torch.tensor(self.mj_datas[i].qpos[3:7], device=self.device)
+            # Convert MuJoCo data (float64) to PyTorch tensors (float32)
+            self.base_pos[i] = torch.tensor(self.mj_datas[i].qpos[:3], dtype=torch.float32, device=self.device)
+            self.base_quat[i] = torch.tensor(self.mj_datas[i].qpos[3:7], dtype=torch.float32, device=self.device)
             
             # Get world-frame velocities from MuJoCo
-            world_lin_vel = torch.tensor(self.mj_datas[i].qvel[:3], device=self.device)
-            world_ang_vel = torch.tensor(self.mj_datas[i].qvel[3:6], device=self.device)
+            world_lin_vel = torch.tensor(self.mj_datas[i].qvel[:3], dtype=torch.float32, device=self.device)
+            world_ang_vel = torch.tensor(self.mj_datas[i].qvel[3:6], dtype=torch.float32, device=self.device)
             
             # Transform to base frame (matching Genesis: transform_by_quat(vel, inv_quat))
             inv_base_quat = self._inv_quat(self.base_quat[i:i+1])
             self.base_lin_vel[i] = self._transform_by_quat(world_lin_vel.unsqueeze(0), inv_base_quat).squeeze(0)
             self.base_ang_vel[i] = self._transform_by_quat(world_ang_vel.unsqueeze(0), inv_base_quat).squeeze(0)
             
-            self.dof_pos[i] = torch.tensor(self.mj_datas[i].qpos[7:19], device=self.device)
-            self.dof_vel[i] = torch.tensor(self.mj_datas[i].qvel[6:18], device=self.device)
+            self.dof_pos[i] = torch.tensor(self.mj_datas[i].qpos[7:19], dtype=torch.float32, device=self.device)
+            self.dof_vel[i] = torch.tensor(self.mj_datas[i].qvel[6:18], dtype=torch.float32, device=self.device)
     
     def _update_observations(self):
         """Construct observation vector - exact same as go2_env.py."""
