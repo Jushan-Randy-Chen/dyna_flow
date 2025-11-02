@@ -1,4 +1,4 @@
-# DynaFlow JAX/MuJoCo Requirements
+# DynaFlow JAX/MuJoCo/Brax Requirements
 
 # Core dependencies
 jax>=0.4.20
@@ -8,12 +8,19 @@ mujoco-mjx>=3.0.0
 flax>=0.7.0
 optax>=0.1.7
 
+# RL training with Brax (replaces rsl_rl)
+brax>=0.9.0
+etils>=1.5.0  # Required by Brax
+orbax-checkpoint>=0.4.0  # Required by Brax
+ml-collections>=0.1.0  # Required for config management
+
 # Data handling
 numpy>=1.24.0
 pandas>=2.0.0
 
-# Visualization and logging (optional)
+# Visualization and logging
 matplotlib>=3.7.0
+mediapy>=1.1.0  # For video rendering
 wandb>=0.15.0
 tqdm>=4.65.0
 
