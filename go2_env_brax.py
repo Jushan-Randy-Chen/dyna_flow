@@ -413,6 +413,76 @@ class Go2Env(PipelineEnv):
         obs = jp.roll(obs_history, obs.size).at[:obs.size].set(obs)
         
         return obs
+    
+    def get_full_state(self, pipeline_state: base.State) -> jax.Array:
+        """
+        Extract the full 37-dimensional state vector.
+        
+        Returns:
+            state (37,): [pos (3), quat (4), joint_pos (12), 
+                         lin_vel (3), ang_vel (3), joint_vel (12)]
+        """
+        # Generalized positions: pos (3) + quat (4) + joint_pos (12) = 19
+        pos = pipeline_state.q[:3]          # base position (x, y, z)
+        quat = pipeline_state.q[3:7]        # base orientation (quaternion w, x, y, z)
+        joint_pos = pipeline_state.q[7:]    # 12 joint positions
+        
+        # Generalized velocities: lin_vel (3) + ang_vel (3) + joint_vel (12) = 18
+        lin_vel = pipeline_state.qd[:3]     # base linear velocity
+        ang_vel = pipeline_state.qd[3:6]    # base angular velocity
+        joint_vel = pipeline_state.qd[6:]   # 12 joint velocities
+        
+        # Concatenate all components
+        full_state = jp.concatenate([
+            pos, quat, joint_pos,      # 3 + 4 + 12 = 19 (positions)
+            lin_vel, ang_vel, joint_vel # 3 + 3 + 12 = 18 (velocities)
+        ])
+        
+        return full_state
+    
+    def get_conditioning_vector(
+        self, 
+        pipeline_state: base.State, 
+        command: jax.Array
+    ) -> jax.Array:
+        """
+        Extract conditioning vector c = [g, v, ω, q, q̇, vcmd_x, vcmd_y, ωcmd_z].
+        
+        Args:
+            pipeline_state: Current pipeline state
+            command: Command vector [vcmd_x, vcmd_y, ωcmd_z]
+        
+        Returns:
+            conditioning (33,): [g (3), v (3), ω (3), q (12), q̇ (12)]
+                                where all velocities are in local frame
+        """
+        # Get projected gravity in local frame (3,)
+        inv_torso_rot = math.quat_inv(pipeline_state.x.rot[0])
+        g = math.rotate(jp.array([0, 0, -1]), inv_torso_rot)
+        
+        # Get base linear velocity in local frame (3,)
+        v = math.rotate(pipeline_state.xd.vel[0], inv_torso_rot)
+        
+        # Get base angular velocity in local frame (3,)
+        ω = math.rotate(pipeline_state.xd.ang[0], inv_torso_rot)
+        
+        # Get joint positions (12,)
+        q = pipeline_state.q[7:]
+        
+        # Get joint velocities (12,)
+        q_dot = pipeline_state.qd[6:]
+        
+        # Concatenate: g (3) + v (3) + ω (3) + q (12) + q̇ (12) + cmd (3) = 36
+        conditioning = jp.concatenate([
+            g,              # projected gravity (3)
+            v,              # base linear velocity (3)
+            ω,              # base angular velocity (3)
+            q,              # joint positions (12)
+            q_dot,          # joint velocities (12)
+            command,        # velocity commands [vcmd_x, vcmd_y, ωcmd_z] (3)
+        ])
+        
+        return conditioning
 
     # ------------ reward functions----------------
     def _reward_lin_vel_z(self, xd: Motion) -> jax.Array:

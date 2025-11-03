@@ -24,7 +24,7 @@ def main():
     parser = argparse.ArgumentParser(description="Visualize trained Go2 policy")
     parser.add_argument("-e", "--exp_name", type=str, required=True,
                         help="Experiment name (must match training)")
-    parser.add_argument("--n_steps", type=int, default=1000,
+    parser.add_argument("--n_steps", type=int, default=500,
                         help="Number of steps to simulate (default: 1000)")
     parser.add_argument("--render_every", type=int, default=2,
                         help="Render every N steps (default: 2)")
@@ -215,12 +215,6 @@ python visualize_brax.py --exp_name ppo_policy
 # Longer rollout with different camera:
 python visualize_brax.py --exp_name ppo_policy --n_steps 2000 --camera side
 
-# Manual command (walk forward at 1 m/s):
-python visualize_brax.py --exp_name ppo_policy --commands 1.0 0.0 0.0 0.3 0.0
-
-# Manual command (turn right while walking):
-python visualize_brax.py --exp_name ppo_policy --commands 0.5 0.0 0.5 0.3 0.0
-
 # Generate interactive HTML visualization:
 python visualize_brax.py --exp_name ppo_policy --html
 
@@ -233,3 +227,4 @@ Available cameras:
 - front: Front view
 - top: Top-down view
 """
+#   Command: vx=1.47, vy=-0.27, ω_z=-0.34
