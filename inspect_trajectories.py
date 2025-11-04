@@ -13,7 +13,9 @@ import matplotlib.pyplot as plt
 
 # Import for HTML visualization
 try:
+    import jax
     from brax import envs
+    from brax.base import Motion, State as BraxState, Transform
     from brax.io import html
     from go2_env_brax import Go2Env
     import jax.numpy as jp
@@ -21,6 +23,12 @@ try:
 except ImportError:
     BRAX_AVAILABLE = False
     print("Warning: Brax not available, HTML visualization will be disabled")
+
+try:
+    import mujoco
+    MUJOCO_AVAILABLE = True
+except ImportError:
+    MUJOCO_AVAILABLE = False
 
 
 def main():
@@ -33,6 +41,8 @@ def main():
                         help="Generate interactive HTML visualization of first episode")
     parser.add_argument("--episode_idx", type=int, default=0,
                         help="Episode index to visualize in detail")
+    parser.add_argument("--downsample", type=int, default=5,
+                        help="HTML frame stride (higher is faster, default=5)")
     args = parser.parse_args()
     
     if not os.path.exists(args.data_path):
@@ -184,61 +194,124 @@ def main():
         if not BRAX_AVAILABLE:
             print("\n❌ HTML visualization requires Brax. Install it to enable this feature.")
         else:
+            import time
+
             print(f"\nGenerating HTML visualization for episode {args.episode_idx}...")
-            
+
             # Register and create environment
             envs.register_environment('go2', Go2Env)
             env = envs.get_environment('go2')
-            
+
             # Reconstruct pipeline states from the collected state data
-            ep_state = np.array(states[args.episode_idx], dtype=np.float32)
-            
-            # Create pipeline states from saved data
-            # Each state is [pos(3), quat(4), joint_pos(12), lin_vel(3), ang_vel(3), joint_vel(12)]
+            episode_raw = np.array(states[args.episode_idx], dtype=np.float32)
+
+            # Downsample frames to control runtime
+            downsample_factor = max(1, args.downsample)
+            if downsample_factor > 1:
+                downsampled = episode_raw[::downsample_factor]
+                print(
+                    f"  Downsampled to {len(downsampled)} frames (factor: {downsample_factor}×, "
+                    f"original: {len(episode_raw)})"
+                )
+            else:
+                downsampled = episode_raw
+                print(f"  Using all {len(downsampled)} frames")
+
+            # Slice state vector into generalized coordinates
+            q_np = np.concatenate(
+                [downsampled[:, 0:3], downsampled[:, 3:7], downsampled[:, 7:19]],
+                axis=1,
+            )
+            qd_np = np.concatenate(
+                [downsampled[:, 19:22], downsampled[:, 22:25], downsampled[:, 25:37]],
+                axis=1,
+            )
+
+            q_all = jp.array(q_np)
+            qd_all = jp.array(qd_np)
+
+            use_mujoco = MUJOCO_AVAILABLE and getattr(env.sys, 'mj_model', None) is not None
             pipeline_states = []
-            
-            for t in range(len(ep_state)):
-                # Extract components
-                pos = ep_state[t, 0:3]
-                quat = ep_state[t, 3:7]
-                joint_pos = ep_state[t, 7:19]
-                lin_vel = ep_state[t, 19:22]
-                ang_vel = ep_state[t, 22:25]
-                joint_vel = ep_state[t, 25:37]
-                
-                # Construct q (generalized positions): [pos(3), quat(4), joint_pos(12)]
-                q = jp.concatenate([pos, quat, joint_pos])
-                
-                # Construct qd (generalized velocities): [lin_vel(3), ang_vel(3), joint_vel(12)]
-                qd = jp.concatenate([lin_vel, ang_vel, joint_vel])
-                
-                # Create a pipeline state
-                # Note: We need to call pipeline_init to get the proper structure
-                # then replace q and qd
-                if t == 0:
-                    # Initialize with first state
-                    init_state = env.pipeline_init(q, qd)
-                    pipeline_states.append(init_state)
+
+            if use_mujoco:
+                print("  Using MuJoCo forward kinematics for fast rendering")
+                model = env.sys.mj_model
+                data = mujoco.MjData(model)
+
+                # Seed contact structure and link count from a single Brax state
+                template_state = env.pipeline_init(q_all[0], qd_all[0])
+                link_count = int(template_state.x.pos.shape[0])
+
+                body_offset = model.nbody - link_count
+                if body_offset not in (0, 1):
+                    print("  ⚠️ Body count mismatch between Brax and MuJoCo; falling back to Brax pipeline")
+                    use_mujoco = False
                 else:
-                    # Reuse structure but update q and qd
-                    state = env.pipeline_init(q, qd)
+                    body_start = 0 if body_offset == 0 else 1
+                    zeros_ang = jp.zeros((link_count, 3))
+                    zeros_vel = jp.zeros((link_count, 3))
+
+                    for i in range(len(downsampled)):
+                        data.qpos[:] = q_np[i]
+                        data.qvel[:] = qd_np[i]
+                        mujoco.mj_forward(model, data)
+
+                        pos = jp.array(
+                            np.asarray(
+                                data.xpos[body_start:body_start + link_count],
+                                dtype=np.float32,
+                            )
+                        )
+                        rot = jp.array(
+                            np.asarray(
+                                data.xquat[body_start:body_start + link_count],
+                                dtype=np.float32,
+                            )
+                        )
+
+                        x_tf = Transform(pos=pos, rot=rot)
+                        xd_motion = Motion(ang=zeros_ang, vel=zeros_vel)
+
+                        state = BraxState(
+                            q=jp.array(q_np[i]),
+                            qd=jp.array(qd_np[i]),
+                            x=x_tf,
+                            xd=xd_motion,
+                            contact=None,
+                        )
+                        pipeline_states.append(state)
+
+            if not use_mujoco:
+                print("  Falling back to Brax pipeline reconstruction (this can take a bit)" )
+                pipeline_fn = jax.jit(env.pipeline_init)
+                t0 = time.time()
+                for i in range(len(downsampled)):
+                    state = pipeline_fn(jp.array(q_np[i]), jp.array(qd_np[i]))
                     pipeline_states.append(state)
-            
+                    if i % 20 == 0:
+                        print(f"    Progress: {i}/{len(downsampled)}", end='\r')
+                print(f"\n    Reconstruction took {time.time() - t0:.2f}s")
+
             # Render to HTML
-            html_path = os.path.join(os.path.dirname(args.data_path), 
-                                     f'episode_{args.episode_idx}_visualization.html')
+            html_path = os.path.join(
+                os.path.dirname(args.data_path),
+                f'episode_{args.episode_idx}_visualization.html'
+            )
+            print("  Rendering HTML...")
+            t0 = time.time()
             html_string = html.render(
-                env.sys.tree_replace({'opt.timestep': env.dt}),
+                env.sys.tree_replace({'opt.timestep': env.dt * downsample_factor}),
                 pipeline_states,
-                height=480,
+                height=1080,
                 colab=False
             )
-            
+            print(f"    Rendering took {time.time() - t0:.2f}s")
+
             with open(html_path, 'w') as f:
                 f.write(html_string)
-            
+
             print(f"✓ HTML visualization saved to {html_path}")
-            print(f"  Open it in a web browser to view the interactive 3D animation")
+            print("  Open it in a web browser to view the interactive 3D animation")
     
     print("\n" + "=" * 80)
 
@@ -258,12 +331,18 @@ python inspect_trajectories.py --data_path logs/ppo_policy/trajectories/trajecto
 # With plots:
 python inspect_trajectories.py --data_path logs/ppo_policy/trajectories/trajectories.npz --plot
 
-# With interactive HTML visualization:
+# With interactive HTML visualization (default 5x downsample):
 python inspect_trajectories.py --data_path logs/ppo_policy/trajectories/trajectories.npz --html
+
+# Higher fidelity HTML (2x downsample):
+python inspect_trajectories.py --data_path logs/ppo_policy/trajectories/trajectories.npz --html --downsample 2
 
 # Everything together:
 python inspect_trajectories.py --data_path logs/ppo_policy/trajectories/trajectories.npz --plot --html
 
 # Inspect different episode:
 python inspect_trajectories.py --data_path logs/ppo_policy/trajectories/trajectories.npz --html --episode_idx 5
+
+# Fast preview (10x downsample):
+python inspect_trajectories.py --data_path logs/ppo_policy/trajectories/trajectories.npz --html --downsample 10
 """
