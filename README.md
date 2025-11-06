@@ -1,221 +1,413 @@
-# DynaFlow - JAX/MuJoCo Implementation
+# DynaFlow
 
-This is a JAX/MuJoCo reimplementation of **DynaFlow: Dynamics-embedded Flow Matching for Physically Consistent Motion Generation from State-only Demonstrations**.
+**Dynamics-embedded Flow Matching for Physically Consistent Motion Generation**
 
-Paper: https://arxiv.org/html/2509.19804v2
+[![Paper](https://img.shields.io/badge/arXiv-2509.19804-b31b1b.svg)](https://arxiv.org/html/2509.19804v2)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-## Overview
+This is a JAX/MuJoCo implementation of **DynaFlow**, which embeds a differentiable physics simulator directly into a flow matching model to guarantee physically consistent motion generation from state-only demonstrations.
 
-DynaFlow embeds a differentiable simulator directly into a flow matching model to guarantee physically consistent motion generation. By generating trajectories in the action space and mapping them to dynamically feasible state trajectories via the simulator, DynaFlow ensures all outputs are physically consistent by construction.
+**Ackowledgement & disclaimer: I am not the author of this work!! This is my own implementation following the paper. 
 
-This implementation uses:
-- **JAX** for automatic differentiation and high-performance computation
-- **MuJoCo MJX** for massively parallel differentiable physics simulation
-- **Flax** for neural network implementation (DiT transformer)
-- **Optax** for optimization
+## 🎯 Overview
 
-## Key Features
+DynaFlow generates trajectories in the **action space** and maps them to dynamically feasible **state trajectories** via a differentiable simulator. This ensures all outputs are physically consistent by construction.
 
-- ✅ Differentiable MuJoCo rollout operator Φ: (x₀, U) → X₁
-- ✅ 1D Diffusion Transformer (DiT) for action prediction
-- ✅ Conditional flow matching loss with state-only demonstrations
-- ✅ Single-step ODE integration for real-time inference
-- ✅ Support for conditioning on observations, commands, and gait modes
-- ✅ **Complete RL training pipeline** for collecting demonstration data (PPO in MuJoCo)
+**Key Innovation:** Instead of learning state transitions directly, DynaFlow learns to predict actions U, then uses a differentiable physics simulator Φ to compute the resulting state trajectory:
 
-## Installation
+```
+X̂₁ = Φ(x₀, U)  where  U = D_θ(X_t, c, t)
+```
 
-### Option 1: Using pip
+### Technology Stack
+
+- **JAX** - Automatic differentiation and XLA compilation
+- **MuJoCo MJX** - GPU-accelerated differentiable physics
+- **Flax/Linen** - Neural network library
+- **Optax** - Gradient-based optimization
+
+### Key Features
+
+✅ Differentiable physics rollout: Φ(x₀, U) → X  
+✅ 1D Diffusion Transformer (DiT) for action prediction  
+✅ Conditional flow matching with state-only demonstrations  
+✅ Single-step ODE sampling for real-time inference  
+✅ Continuous conditioning (observations, commands, gait modes)  
+✅ PPO trajectory collection pipeline
+
+---
+
+## 📦 Installation
+
+### Prerequisites
+
+- Python 3.8+
+- CUDA-capable GPU (recommended)
+- MuJoCo 3.0+
+
+### Quick Install
+
 ```bash
-# Install from source
 cd dyna_flow
 pip install -e .
 ```
 
-### Option 2: Manual installation
+This installs:
+- `jax[cuda]` - GPU acceleration
+- `mujoco>=3.0.0` and `mujoco-mjx>=3.0.0` - Physics simulation
+- `flax` and `optax` - Neural networks and optimization
+- `numpy`, `pandas` - Data handling
+
+### Optional Dependencies
+
 ```bash
-pip install jax jaxlib mujoco>=3.0.0 mujoco-mjx>=3.0.0 flax optax numpy pandas
-pip install wandb tqdm  # optional, for logging and progress bars
+pip install wandb tqdm  # For experiment tracking and progress bars
 ```
 
 ### Verify Installation
+
 ```bash
-python -c "import jax; import mujoco; from mujoco import mjx; print('✓ All dependencies installed')"
+python -c "import jax; import mujoco; from mujoco import mjx; print('✓ Ready to go!')"
 ```
 
-## Quick Start
+---
 
-### 1. Run the Example
+## 🚀 Quick Start
+
+### 1. Test the Installation
+
+Run a minimal training example on synthetic data:
+
 ```bash
-cd dyna_flow
 python example.py
 ```
 
-This will train a small model on synthetic data and demonstrate sampling.
+This demonstrates the complete pipeline: data loading → model creation → training → sampling.
 
-### 2. Generate Training Data (PPO RL Pipeline)
+### 2. Collect Demonstration Data
 
-**NEW**: Train a PPO policy using rsl_rl and collect demonstration trajectories:
+**Option A: Train PPO Policy** (Recommended)
+
+Train a PPO policy to collect high-quality demonstrations:
 
 ```bash
-# Step 1: Train PPO policy (takes ~1-2 hours on GPU)
-python train_ppo.py --exp_name go2-ppo --num_envs 4096 --max_iterations 10000
+# Train policy (1-2 hours on GPU)
+python train_ppo.py \
+  --exp_name go2-locomotion \
+  --num_envs 4096 \
+  --max_iterations 10000
 
-# Step 2: Collect trajectories from trained policy (implementation pending)
-# python collect_trajectories.py \
-#   --checkpoint logs/go2-ppo/model_10000.pt \
-#   --num-episodes 100 \
-#   --output data/trajectories_ppo.npz
+# Collect trajectories from trained policy
+python collect_trajectories_parallel.py \
+  --checkpoint logs/go2-locomotion/model_10000.pt \
+  --num-episodes 10000 \
+  --output logs/go2-locomotion/trajectories/trajectories.npz
 ```
 
-See [PPO_README.md](PPO_README.md) for detailed PPO training documentation.
+**Option B: Use Existing Data**
 
-### 3. Prepare Your Own Data (Alternative)
+Format your data as NPZ with the following structure:
 
-If you have existing trajectory data, format it as NPZ with shape `(N, T, state_dim)` where:
-- `N` = number of episodes
-- `T` = trajectory length
-- `state_dim` = 37 for Go2 (base pos(3) + quat(4) + joints(12) + velocities(18))
-
-Example data preparation:
 ```python
 import numpy as np
 
-# Your trajectories (list of variable-length episodes)
-trajectories = [...]  # List of (T_i, 37) arrays
-
-# Save as NPZ
-np.savez("my_data.npz", trajectories=np.array(trajectories, dtype=object))
-
-# Optional: include conditioning vectors
-conditioning = [...]  # List of (T_i, cond_dim) arrays
-np.savez("my_data.npz", 
-         trajectories=np.array(trajectories, dtype=object),
-         conds=np.array(conditioning, dtype=object))
+# Save trajectories
+np.savez(
+    "my_data.npz",
+    states=np.array(states_list),        # (N, T, 37) - state trajectories
+    conditionings=np.array(conds_list),  # (N, T, cond_dim) - conditioning vectors (optional)
+    actions=np.array(actions_list)       # (N, T, 12) - actions (optional)
+)
 ```
 
-### 4. Train DynaFlow Model
+**State dimension (37):** `[base_pos(3), base_quat(4), joint_pos(12), base_vel(3), base_angvel(3), joint_vel(12)]`
 
-Basic training (XML path auto-detected from local `Unitree_go2/` folder):
+---
+
+## 🎓 Training
+
+### Basic Training
+
 ```bash
-python train.py \
-  --data data/trajectories_rl.npz \
-  --horizon 16 \
+python train_flow_matching.py \
+  --data logs/ppo_policy/trajectories/trajectories.npz \
+  --epochs 100 \
   --batch 64 \
-  --epochs 100 \
-  --save checkpoints/my_model.pkl
+  --horizon 10
 ```
 
-With full options:
+### Full Training Configuration
+
 ```bash
-python train.py \
-  --data data/trajectories_rl.npz \
+python train_flow_matching.py \
+  --data logs/ppo_policy/trajectories/trajectories.npz \
+  --epochs 200 \
+  --batch 128 \
   --horizon 16 \
-  --batch 1024 \
-  --epochs 100 \
   --lr 2e-4 \
   --weight-decay 1e-4 \
   --ema-decay 0.995 \
   --d-model 384 \
   --n-heads 6 \
   --depth 3 \
-  --save checkpoints/dynaflow.pkl \
+  --dropout 0.1 \
+  --save-dir checkpoints/dynaflow \
   --save-interval 10 \
   --wandb online \
-  --wandb-project dynaflow-experiments
+  --wandb-project dynaflow-go2
 ```
 
-> **Note:** The `--xml-path` argument is optional. By default, scripts will use `Unitree_go2/scene_mjx_gym.xml` from the local directory.
+### Training Parameters
 
-### 5. Evaluate the Model
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--data` | Path to NPZ dataset | Required |
+| `--epochs` | Number of training epochs | 100 |
+| `--batch` | Batch size | 32 |
+| `--horizon` | Trajectory prediction horizon | 10 |
+| `--lr` | Learning rate | 1e-4 |
+| `--weight-decay` | AdamW weight decay | 0.0 |
+| `--ema-decay` | Exponential moving average decay | 0.995 |
+| `--d-model` | Transformer hidden dimension | 384 |
+| `--n-heads` | Number of attention heads | 6 |
+| `--depth` | Number of transformer blocks | 3 |
+| `--dropout` | Dropout rate | 0.1 |
+| `--save-dir` | Checkpoint save directory | `checkpoints` |
+| `--save-interval` | Save every N epochs | 10 |
+
+### Monitoring Training
+
+If using Weights & Biases:
 
 ```bash
-python sample.py \
-  --ckpt checkpoints/my_model.pkl \
-  --dataset path/to/test_data.npz \
-  --eval-samples 32 \
-  --batch 8 \
-  --ode-steps 1 \
-  --use-ema \
-  --save-samples results/samples.npz
+python train_flow_matching.py \
+  --data my_data.npz \
+  --wandb online \
+  --wandb-project my-project \
+  --wandb-name my-experiment
 ```
 
-### 5. Sample New Trajectories
+Visit https://wandb.ai to monitor:
+- Training loss curves
+- Learning rate schedule
+- Gradient norms
+- Sample quality metrics
+
+---
+
+## 📊 Evaluation & Sampling
+
+### Evaluate on Test Set
+
+```bash
+python evaluate.py \
+  --checkpoint checkpoints/dynaflow/epoch_200.pkl \
+  --dataset test_data.npz \
+  --num-samples 100 \
+  --batch 32 \
+  --ode-steps 1 \
+  --use-ema
+```
+
+### Sample Trajectories Programmatically
 
 ```python
 import jax
-from jax import random
 import jax.numpy as jnp
-from dyna_flow.utils import load_checkpoint
-from dyna_flow.model import ActionPredictor
-from dyna_flow.rollout import create_go2_rollout
-from dyna_flow.losses import sample_trajectory
+from model import create_action_predictor
+from rollout import create_go2_rollout
+from losses import sample_trajectory
+from utils import load_checkpoint
 
-# Load checkpoint
-ckpt = load_checkpoint("checkpoints/my_model.pkl")
-params = ckpt['ema_params']  # or ckpt['params']
+# Load trained model
+ckpt = load_checkpoint("checkpoints/dynaflow/epoch_200.pkl")
+params = ckpt['ema_params']  # Use EMA parameters for better quality
 
-# Create model and rollout
-model = ActionPredictor(
-    state_dim=ckpt['state_dim'],
-    action_dim=ckpt['action_dim'],
+# Create model
+model, _ = create_action_predictor(
+    state_dim=37,
+    action_dim=12,
+    d_model=384,
+    n_heads=6,
+    depth=3,
     cond_dim=ckpt.get('cond_dim')
 )
-rollout = create_go2_rollout(xml_path="path/to/scene_mjx_gym.xml")
 
-# Sample trajectories
-rng = random.PRNGKey(0)
-x0 = jnp.array([[0, 0, 0.27, 1, 0, 0, 0, ...]])  # Initial state
+# Create physics simulator
+rollout = create_go2_rollout(xml_path="Unitree_go2/scene_mjx_gym.xml")
+
+# Initial state: [x, y, z=0.27m, quat(w,x,y,z), joints(12), velocities(18)]
+x0 = jnp.array([[
+    0.0, 0.0, 0.27,           # Base position
+    1.0, 0.0, 0.0, 0.0,       # Base orientation (quaternion)
+    0.0, 0.9, -1.8,           # Front left leg
+    0.0, 0.9, -1.8,           # Front right leg
+    0.0, 0.9, -1.8,           # Rear left leg
+    0.0, 0.9, -1.8,           # Rear right leg
+    *[0.0] * 18               # Velocities (all zero)
+]])
+
+# Optional: conditioning vector (e.g., target velocity, gait mode)
+cond = jnp.array([[1.0, 0.0, 0.0, ...]])  # Shape: (1, cond_dim)
+
+# Sample trajectory
+rng = jax.random.PRNGKey(42)
 X, U = sample_trajectory(
-    model.apply, params, rollout, x0,
-    horizon=16, state_dim=37, ode_steps=1, rng=rng
+    model.apply,
+    params,
+    rollout,
+    x0,
+    horizon=16,
+    state_dim=37,
+    ode_steps=1,  # Single-step for real-time inference
+    cond=cond,
+    rng=rng
 )
 
-print(f"Sampled trajectory: {X.shape}")  # (1, 17, 37)
-print(f"Actions: {U.shape}")  # (1, 16, 12)
+print(f"Generated state trajectory: {X.shape}")  # (1, 17, 37)
+print(f"Generated actions: {U.shape}")           # (1, 16, 12)
 ```
 
-## Architecture
+### Batch Sampling
 
-### Action Predictor (DiT1d)
-- 1D Diffusion Transformer with 3 blocks (configurable)
-- Inputs: noisy state trajectory X_t, time t, optional conditioning c
-- Outputs: action sequence U^
+```python
+# Sample multiple trajectories in parallel
+batch_size = 32
+x0_batch = jnp.tile(x0, (batch_size, 1, 1))
+cond_batch = jnp.tile(cond, (batch_size, 1)) if cond is not None else None
 
-### Differentiable Rollout
-- MuJoCo MJX-based simulator
-- Maps (x₀, U) to full state trajectory X₁ through recursive dynamics
-- Fully differentiable for end-to-end training
+X_batch, U_batch = sample_trajectory(
+    model.apply, params, rollout, x0_batch,
+    horizon=16, state_dim=37, ode_steps=1,
+    cond=cond_batch, rng=rng
+)
 
-### Loss Function
-Conditional Matching Loss (Eq. 4 from paper):
+print(f"Batch trajectories: {X_batch.shape}")  # (32, 17, 37)
+```
+
+### Save Generated Trajectories
+
+```python
+import numpy as np
+
+# Save for visualization or further analysis
+np.savez(
+    "generated_trajectories.npz",
+    states=np.array(X),
+    actions=np.array(U),
+    conditioning=np.array(cond) if cond is not None else None
+)
+```
+
+---
+
+## 🏗️ Architecture
+
+### Model Components
+
+**1. Action Predictor (D_θ)**
+- **Type:** 1D Diffusion Transformer (DiT)
+- **Input:** Noisy state trajectory X_t, diffusion time t, conditioning c
+- **Output:** Predicted action sequence U
+- **Architecture:**
+  - Sinusoidal position embeddings
+  - Time embedding with Mish activation
+  - Continuous conditioning via attention-based embedder
+  - Multi-head self-attention blocks with adaLN-Zero
+  - Final projection to action space
+
+**2. Differentiable Rollout (Φ)**
+- **Type:** MuJoCo MJX physics simulator
+- **Input:** Initial state x₀, action sequence U
+- **Output:** Full state trajectory X
+- **Features:**
+  - Batched parallel simulation via `jax.vmap`
+  - Fully differentiable for gradient-based training
+  - GPU-accelerated for efficiency
+
+**3. Flow Matching Loss**
+
+Conditional Matching Loss (Equation 4 from paper):
+
 ```
 L(θ) = E[||W ⊙ (X̂₁ - X₁)||²]
 ```
-where X̂₁ = Φ(x₀, D_θ(X_t, c, t))
 
-## File Structure
+where:
+- `X̂₁ = Φ(x₀, D_θ(X_t, c, t))` - Predicted trajectory via simulator
+- `X₁` - Ground truth trajectory from demonstrations
+- `W` - Weighting matrix (optional, for joint-specific weights)
+- `X_t = t·X₁ + (1-t)·X₀` - Interpolated noisy trajectory
+- `t ~ U(0,1)` - Diffusion time
+
+### Training Pipeline
+
+```
+1. Sample batch of demonstrations: (x₀, X₁, c)
+2. Sample diffusion time: t ~ U(0,1)
+3. Create noisy trajectory: X_t = t·X₁ + (1-t)·X₀
+4. Predict actions: U = D_θ(X_t, c, t)
+5. Simulate trajectory: X̂₁ = Φ(x₀, U)
+6. Compute loss: L = ||X̂₁ - X₁||²
+7. Update parameters: θ ← θ - ∇L
+```
+
+### Inference Pipeline
+
+```
+1. Start with noise: X₀ ~ N(X₀|x₀, σ²I)
+2. For t from 1 to 0 (single-step ODE):
+   a. Predict actions: U = D_θ(X_t, c, t)
+   b. Simulate: X̂₁ = Φ(x₀, U)
+   c. Update: X_t ← X̂₁
+3. Return final trajectory: X̂₁
+```
+
+---
+
+## 📁 Project Structure
 
 ```
 dyna_flow/
-├── __init__.py         # Package initialization
-├── model.py            # JAX/Flax DiT transformer
-├── rollout.py          # MuJoCo MJX differentiable rollout
-├── losses.py           # Flow matching loss functions
-├── data.py             # Dataset loading and preprocessing
-├── utils.py            # Helper functions
-├── train.py            # Training script
-├── sample.py           # Sampling/evaluation script
-└── README.md           # This file
+├── model.py                    # DiT transformer architecture
+├── rollout.py                  # MuJoCo MJX differentiable simulator
+├── losses.py                   # Flow matching loss and sampling
+├── data.py                     # Dataset loading utilities
+├── utils.py                    # Helper functions
+├── train_flow_matching.py      # Main training script
+├── evaluate.py                 # Evaluation script
+├── train_ppo.py                # PPO policy training
+├── collect_trajectories_parallel.py  # Trajectory collection
+├── Unitree_go2/                # MuJoCo XML models
+│   └── scene_mjx_gym.xml
+└── README.md                   # This file
 ```
 
-## Citation
+---
+
+<!-- ## 📝 Citation
+
+If you find this work useful, please cite:
 
 ```bibtex
 @article{lee2025dynaflow,
-  title={DynaFlow: Dynamics-embedded Flow Matching for Physically Consistent Motion Generation from State-only Demonstrations},
+  title={DynaFlow: Dynamics-embedded Flow Matching for Physically Consistent 
+         Motion Generation from State-only Demonstrations},
   author={Lee, Sowoo and Kang, Dongyun and Park, Jaehyun and Park, Hae-Won},
   journal={arXiv preprint arXiv:2509.19804},
   year={2025}
 }
-```
+``` -->
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+---
+
+## 🙏 Acknowledgments
+
+- Original DynaFlow paper and authors at Korea Advanced Institute of Science & Technology (KAIST)
+
