@@ -1,4 +1,4 @@
-# DynaFlow
+# Implementation of the flow-matching policy proposed in Dynamics-embedded Flow Matching for Physically Consistent Motion Generation
 
 **Dynamics-embedded Flow Matching for Physically Consistent Motion Generation**
 
