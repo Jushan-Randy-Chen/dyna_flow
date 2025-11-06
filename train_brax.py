@@ -118,7 +118,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train Go2 with Brax PPO")
     parser.add_argument("-e", "--exp_name", type=str, default="ppo_policy")
     parser.add_argument("--num_envs", type=int, default=8192, 
-                        help="Number of parallel environments (default: 8192)")
+                        help="Number of parallel environments (default: 4096)")
     parser.add_argument("--num_timesteps", type=int, default=100_000_000,
                         help="Total training timesteps (default: 100M)")
     parser.add_argument("--num_evals", type=int, default=10,
@@ -127,7 +127,7 @@ def main():
                         help="Episode length in steps (default: 1000)")
     parser.add_argument("--batch_size", type=int, default=256,
                         help="Batch size for training (default: 256)")
-    parser.add_argument("--unroll_length", type=int, default=20,
+    parser.add_argument("--unroll_length", type=int, default=24, #20 vs 24?
                         help="Number of steps to unroll for training (default: 20)")
     parser.add_argument("--num_minibatches", type=int, default=32,
                         help="Number of minibatches (default: 32)")
@@ -166,10 +166,7 @@ def main():
     
     # Create environment
     print("\nCreating Go2 environment...")
-    # env_kwargs = {}
-    # if args.xml_path:
-    #     env_kwargs['xml_path'] = args.xml_path
-    
+
     env = envs.get_environment('go2')
     eval_env = envs.get_environment('go2')
     print(f"✓ Environment created")
@@ -190,7 +187,7 @@ def main():
     
     make_networks_factory = functools.partial(
     ppo_networks.make_ppo_networks,
-        policy_hidden_layer_sizes=(128, 128, 128, 128))
+        policy_hidden_layer_sizes=(512, 256, 128))
     
     # Configure training
     print("\nConfiguring PPO training...")
@@ -211,7 +208,7 @@ def main():
       num_envs=args.num_envs, 
       batch_size=args.batch_size,
       network_factory=make_networks_factory,
-      randomization_fn=domain_randomize,
+      randomization_fn=None, #maybe we turn off domain randomization for now for faster training?
       policy_params_fn=policy_params_fn,
       seed=args.seed)
     

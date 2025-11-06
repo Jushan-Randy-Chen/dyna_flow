@@ -19,6 +19,30 @@ from brax.io import model
 
 from go2_env_brax import Go2Env
 
+XY_BOUNDS = (-10.0, 10.0)
+KP_POS = 1.0
+KP_YAW = 1.5
+ALPHA = 0.3
+LIN_X_RANGE = (0.0, 1.5)
+LIN_Y_RANGE = (-0.2, 0.2)
+ANG_RANGE = (-0.4, 0.4)
+WAYPOINT_THRESHOLD = 0.15
+COMMAND_SCALE = jp.array([2.0, 2.0, 0.25])
+
+
+def wrap_to_pi(angle: jax.Array) -> jax.Array:
+    return jp.mod(angle + jp.pi, 2.0 * jp.pi) - jp.pi
+
+
+def yaw_from_quat(quat: jax.Array) -> jax.Array:
+    w = quat[..., 0]
+    x = quat[..., 1]
+    y = quat[..., 2]
+    z = quat[..., 3]
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return jp.arctan2(siny_cosp, cosy_cosp)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Collect expert trajectories in parallel")
@@ -72,7 +96,7 @@ def main():
     
     make_networks = functools.partial(
         ppo_networks.make_ppo_networks,
-        policy_hidden_layer_sizes=(128, 128, 128, 128),
+        policy_hidden_layer_sizes=(512, 256, 128),
     )
     
     network = make_networks(
@@ -91,33 +115,69 @@ def main():
     def rollout_episode(rng):
         """Run a single episode and return trajectory data."""
         # Reset
-        reset_rng, cmd_rng, rollout_rng = jax.random.split(rng, 3)
+        reset_rng, wp_rng, rollout_rng = jax.random.split(rng, 3)
         state = env.reset(reset_rng)
-        
-        # Sample command
-        command = env.sample_command(cmd_rng)
-        state.info['command'] = command
-        
-        # Storage for trajectory
+        wp_rng, init_wp_rng = jax.random.split(wp_rng)
+        target_wp = jax.random.uniform(
+            wp_rng, (2,), minval=XY_BOUNDS[0], maxval=XY_BOUNDS[1]
+        )
+        prev_cmd = jp.zeros(3)
+
         def step_fn(carry, _):
-            state, rng = carry
-            act_rng, rng = jax.random.split(rng)
-            
-            # Get action
-            action, _ = inference_fn(state.obs, act_rng)
-            
-            # Extract state and conditioning
+            state, rng, target_wp, prev_cmd, wp_rng = carry
+            rng, act_rng = jax.random.split(rng)
+
             full_state = env.get_full_state(state.pipeline_state)
-            conditioning = env.get_conditioning_vector(state.pipeline_state, state.info['command'])
-            
-            # Step
+            base_pos = full_state[:3]
+            yaw = yaw_from_quat(full_state[3:7])
+
+            dx = target_wp[0] - base_pos[0]
+            dy = target_wp[1] - base_pos[1]
+            dist = jp.sqrt(dx * dx + dy * dy + 1e-9)
+            desired_yaw = jp.arctan2(dy, dx)
+            yaw_err = wrap_to_pi(desired_yaw - yaw)
+
+            v_fwd = jp.clip(KP_POS * dist, LIN_X_RANGE[0], LIN_X_RANGE[1])
+            v_lat = jp.clip(jp.zeros(()), LIN_Y_RANGE[0], LIN_Y_RANGE[1])
+            w_yaw = jp.clip(KP_YAW * yaw_err, ANG_RANGE[0], ANG_RANGE[1])
+
+            cmds_raw = jp.stack([v_fwd, v_lat, w_yaw])
+            cmds = ALPHA * cmds_raw + (1.0 - ALPHA) * prev_cmd
+
+            state.info['command'] = cmds
+            obs_with_cmd = state.obs.at[9:12].set(cmds * COMMAND_SCALE)
+            state = state.tree_replace({'obs': obs_with_cmd})
+
+            conditioning = env.get_conditioning_vector(state.pipeline_state, cmds)
+            action, _ = inference_fn(state.obs, act_rng)
+
             next_state = env.step(state, action)
-            
-            return (next_state, rng), (full_state, conditioning, action, next_state.done)
-        
-        # Run trajectory
+            next_full_state = env.get_full_state(next_state.pipeline_state)
+
+            dx_post = target_wp[0] - next_full_state[0]
+            dy_post = target_wp[1] - next_full_state[1]
+            dist_post = jp.sqrt(dx_post * dx_post + dy_post * dy_post)
+
+            wp_rng, sample_rng = jax.random.split(wp_rng)
+            new_target = jax.random.uniform(
+                sample_rng, (2,), minval=XY_BOUNDS[0], maxval=XY_BOUNDS[1]
+            )
+            target_wp = jp.where(dist_post < WAYPOINT_THRESHOLD, new_target, target_wp)
+
+            outputs = (
+                full_state,
+                conditioning,
+                action,
+                next_state.done,
+            )
+
+            return (next_state, rng, target_wp, cmds, wp_rng), outputs
+
         _, (states, conditionings, actions, dones) = jax.lax.scan(
-            step_fn, (state, rollout_rng), None, length=args.max_steps
+            step_fn,
+            (state, rollout_rng, target_wp, prev_cmd, init_wp_rng),
+            None,
+            length=args.max_steps,
         )
         
         # Check if episode completed without early termination

@@ -25,7 +25,7 @@ def main():
     parser.add_argument("-e", "--exp_name", type=str, required=True,
                         help="Experiment name (must match training)")
     parser.add_argument("--n_steps", type=int, default=500,
-                        help="Number of steps to simulate (default: 1000)")
+                        help="Number of steps to simulate (default: 500)")
     parser.add_argument("--render_every", type=int, default=2,
                         help="Render every N steps (default: 2)")
     parser.add_argument("--camera", type=str, default="track",
@@ -37,6 +37,12 @@ def main():
                         help="Output video path (default: logs/{exp_name}/rollout.mp4)")
     parser.add_argument("--commands", type=float, nargs=3, default=None,
                         help="Manual commands [vx vy vyaw] (optional)")
+    parser.add_argument("--linear_increase", action="store_true", default=True,
+                        help="Linearly increase forward velocity command over time (default: True)")
+    parser.add_argument("--no_linear_increase", action="store_false", dest="linear_increase",
+                        help="Disable linear velocity increase")
+    parser.add_argument("--max_velocity", type=float, default=1.5,
+                        help="Maximum forward velocity for linear increase (default: 1.5 m/s)")
     parser.add_argument("--html", action="store_true",
                         help="Also generate interactive HTML visualization")
     args = parser.parse_args()
@@ -75,24 +81,29 @@ def main():
     
     # Create inference function (this comes from training, we need to rebuild it)
     from brax.training.agents.ppo import networks as ppo_networks
+    from brax.training.acme import running_statistics
     import functools
+    
+    # IMPORTANT: Use the same normalization function used during training
+    # since normalize_observations=True was used in train_brax.py
+    normalize = running_statistics.normalize
     
     make_networks = functools.partial(
         ppo_networks.make_ppo_networks,
-        policy_hidden_layer_sizes=(128, 128, 128, 128),
+        policy_hidden_layer_sizes=(512, 256, 128),
     )
     
     network = make_networks(
         observation_size=env.observation_size,
         action_size=env.action_size,
-        preprocess_observations_fn=lambda x, rng=None: x,
+        preprocess_observations_fn=normalize,
     )
     
     make_policy = ppo_networks.make_inference_fn(network)
     inference_fn = make_policy(params)
     jit_inference_fn = jax.jit(inference_fn)
     
-    print("✓ Inference function created")
+    print("✓ Inference function created (with observation normalization)")
     
     # Reset environment
     print(f"\nRunning rollout (seed={args.seed})...")
@@ -107,13 +118,21 @@ def main():
         print(f"Using manual commands: vx={args.commands[0]}, vy={args.commands[1]}, "
               f"vyaw={args.commands[2]}")
         state.info['command'] = jp.array(args.commands)
+        use_linear_increase = False
     else:
-        print(f"Using random commands: {state.info['command']}")
+        if args.linear_increase:
+            print(f"Using linearly increasing velocity: 0.0 → {args.max_velocity} m/s over {args.n_steps} steps")
+            # Start with zero velocity command
+            state.info['command'] = jp.array([0.0, 0.0, 0.0])
+            use_linear_increase = True
+        else:
+            print(f"Using random commands: {state.info['command']}")
+            use_linear_increase = False
     
     rollout = [state.pipeline_state]
     
     # Debug initial state
-    torso_height = state.pipeline_state.x.pos[0, 2]  # Assuming torso is at index 0
+    torso_height = state.pipeline_state.x.pos[0, 2] 
     print(f"\nInitial state diagnostics:")
     print(f"  Torso height: {torso_height:.4f} m")
     print(f"  Done flag: {state.done}")
@@ -130,6 +149,16 @@ def main():
     # Collect trajectory
     print(f"\nStarting rollout...")
     for i in range(args.n_steps):
+        # Update command if using linear increase
+        if use_linear_increase:
+            # Linear ramp from 0 to max_velocity
+            progress = i / max(args.n_steps - 1, 1)
+            current_vx = progress * args.max_velocity
+            state.info['command'] = jp.array([current_vx, 0.0, 0.0])
+            
+            if i % 50 == 0:
+                print(f"  Step {i}: velocity command = {current_vx:.3f} m/s")
+        
         act_rng, rng = jax.random.split(rng)
         ctrl, _ = jit_inference_fn(state.obs, act_rng)
         state = jit_step(state, ctrl)
@@ -156,7 +185,7 @@ def main():
             print(f"\n  ❌ Episode terminated at step {i}")
             print(f"  Termination diagnostics:")
             print(f"    - Torso height: {torso_height:.4f} m (threshold: 0.18)")
-            print(f"    - Upright dot product: {upright:.4f} (threshold: 0.0)")
+            print(f"    - Upright dot product: {upright:.4f} ")
             print(f"    - Joint angles below lower limit: {jp.any(below_lower)} {jp.where(below_lower)[0]}")
             print(f"    - Joint angles above upper limit: {jp.any(above_upper)} {jp.where(above_upper)[0]}")
             if jp.any(below_lower) or jp.any(above_upper):

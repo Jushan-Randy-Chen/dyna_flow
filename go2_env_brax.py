@@ -245,7 +245,7 @@ class Go2Env(PipelineEnv):
     
     def sample_command(self, rng: jax.Array) -> jax.Array:
         """Sample random command: [lin_vel_x, lin_vel_y, ang_vel_yaw]"""
-        lin_vel_x = [-0.6, 1.5]  # min max [m/s]
+        lin_vel_x = [-0.5, 1.5]  # min max [m/s]
         lin_vel_y = [-0.8, 0.8]  # min max [m/s]
         ang_vel_yaw = [-0.7, 0.7]  # min max [rad/s]
         
@@ -280,8 +280,7 @@ class Go2Env(PipelineEnv):
             'step': 0,
         }
         
-        obs_history = jp.zeros(15 * 31)  # store 15 steps of history
-        obs = self._get_obs(pipeline_state, state_info, obs_history)
+        obs = self._get_obs(pipeline_state, state_info)
         reward, done = jp.zeros(2)
         metrics = {'total_dist': 0.0}
         for k in state_info['rewards']:
@@ -291,7 +290,7 @@ class Go2Env(PipelineEnv):
     
     def step(self, state: State, action: jax.Array) -> State:  # pytype: disable=signature-mismatch
         rng, cmd_rng, kick_noise_2 = jax.random.split(state.info['rng'], 3)
-
+        
         # kick
         push_interval = 10
         kick_theta = jax.random.uniform(kick_noise_2, maxval=2 * jp.pi)
@@ -308,7 +307,7 @@ class Go2Env(PipelineEnv):
         x, xd = pipeline_state.x, pipeline_state.xd
         
         # observation data
-        obs = self._get_obs(pipeline_state, state.info, state.obs)
+        obs = self._get_obs(pipeline_state, state.info)
         joint_angles = pipeline_state.q[7:]
         joint_vel = pipeline_state.qd[6:]
 
@@ -322,8 +321,22 @@ class Go2Env(PipelineEnv):
         state.info['feet_air_time'] += self.dt
 
         # done if joint limits are reached or robot is falling
-        up = jp.array([0.0, 0.0, 1.0])
-        done = jp.dot(math.rotate(up, x.rot[self._torso_idx - 1]), up) < 0
+        base_quat = x.rot[self._torso_idx - 1]
+        # roll/pitch derived from quaternion (yaw ignored for fall condition)
+        w = base_quat[0]
+        xq = base_quat[1]
+        yq = base_quat[2]
+        zq = base_quat[3]
+
+        sinr_cosp = 2.0 * (w * xq + yq * zq)
+        cosr_cosp = 1.0 - 2.0 * (xq * xq + yq * yq)
+        roll = jp.arctan2(sinr_cosp, cosr_cosp)
+
+        sinp = 2.0 * (w * yq - zq * xq)
+        pitch = jp.arcsin(jp.clip(sinp, -1.0, 1.0))
+
+        angle_threshold = jp.pi / 18.0  # 10 degrees in radians
+        done = (jp.abs(roll) > angle_threshold) | (jp.abs(pitch) > angle_threshold)
         done |= jp.any(joint_angles < self.lowers)
         done |= jp.any(joint_angles > self.uppers)
         done |= pipeline_state.x.pos[self._torso_idx - 1, 2] < 0.18
@@ -392,25 +405,40 @@ class Go2Env(PipelineEnv):
         self,
         pipeline_state: base.State,
         state_info: dict[str, Any],
-        obs_history: jax.Array,
     ) -> jax.Array:
         inv_torso_rot = math.quat_inv(pipeline_state.x.rot[0])
-        local_rpyrate = math.rotate(pipeline_state.xd.ang[0], inv_torso_rot)
+        
+        # Get base velocities in local frame
+        local_lin_vel = math.rotate(pipeline_state.xd.vel[0], inv_torso_rot)
+        local_ang_vel = math.rotate(pipeline_state.xd.ang[0], inv_torso_rot)
 
+        """
+        Full observation space from Unitree RL official repo (48-dim):
+        self.obs_buf = torch.cat((  self.base_lin_vel * self.obs_scales.lin_vel, #3
+                                self.base_ang_vel  * self.obs_scales.ang_vel, #3
+                                self.projected_gravity, #3
+                                self.commands[:, :3] * self.commands_scale, #3
+                                (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos, #12
+                                self.dof_vel * self.obs_scales.dof_vel, #12 
+                                self.actions #12
+                                ),dim=-1)
+        Total: 3 + 3 + 3 + 3 + 12 + 12 + 12 = 48
+        """
+     
         obs = jp.concatenate([
-            jp.array([local_rpyrate[2]]) * 0.25,                 # yaw rate
-            math.rotate(jp.array([0, 0, -1]), inv_torso_rot),    # projected gravity
-            state_info['command'] * jp.array([2.0, 2.0, 0.25]),  # command
-            pipeline_state.q[7:] - self._default_pose,           # motor angles
-            state_info['last_act'],                              # last action
+            local_lin_vel * 2.0,                                  # base linear velocity (3)
+            local_ang_vel * 0.25,                                 # base angular velocity (3)
+            math.rotate(jp.array([0, 0, -1]), inv_torso_rot),    # projected gravity (3)
+            state_info['command'] * jp.array([2.0, 2.0, 0.25]),  # command (3)
+            (pipeline_state.q[7:] - self._default_pose) * 1.0,   # motor joint angles (12)
+            pipeline_state.qd[6:] * 0.05,                        # motor joint velocities (12)
+            state_info['last_act'],                              # last action (12)
         ])
         
         # clip, noise
         obs = jp.clip(obs, -100.0, 100.0) + self._obs_noise * jax.random.uniform(
             state_info['rng'], obs.shape, minval=-1, maxval=1
         )
-        # stack observations through time
-        obs = jp.roll(obs_history, obs.size).at[:obs.size].set(obs)
         
         return obs
     
