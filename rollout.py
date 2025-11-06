@@ -82,19 +82,19 @@ class MuJoCoGo2Rollout:
     
     def _state_from_mjx_data(self, data: mjx.Data) -> jnp.ndarray:
         """
-        Extract state vector from MJX data.
+        Extract state vector from MJX data (non-batched).
         
         Args:
-            data: MJX data object (batched)
+            data: MJX data object (single trajectory, no batch)
         Returns:
-            State tensor (batch, 37)
+            State tensor (37,)
         """
-        base_pos = data.qpos[:, :3]  # (batch, 3)
-        base_quat = data.qpos[:, 3:7]  # (batch, 4)
-        joint_pos = data.qpos[:, 7:19]  # (batch, 12)
-        base_linvel = data.qvel[:, :3]  # (batch, 3)
-        base_angvel = data.qvel[:, 3:6]  # (batch, 3)
-        joint_vel = data.qvel[:, 6:18]  # (batch, 12)
+        base_pos = data.qpos[:3]  # (3,)
+        base_quat = data.qpos[3:7]  # (4,)
+        joint_pos = data.qpos[7:19]  # (12,)
+        base_linvel = data.qvel[:3]  # (3,)
+        base_angvel = data.qvel[3:6]  # (3,)
+        joint_vel = data.qvel[6:18]  # (12,)
         
         return jnp.concatenate([
             base_pos, base_quat, joint_pos,
@@ -103,21 +103,21 @@ class MuJoCoGo2Rollout:
     
     def _set_mjx_state(self, data: mjx.Data, state: jnp.ndarray) -> mjx.Data:
         """
-        Set MJX data from state vector.
+        Set MJX data from state vector (single state, no batch).
         
         Args:
             data: MJX data object to modify
-            state: State tensor (batch, 37)
+            state: State tensor (37,) - NO BATCH DIMENSION
         Returns:
             Updated MJX data
         """
         # Unpack state
-        base_pos = state[:, :3]
-        base_quat = state[:, 3:7]
-        joint_pos = state[:, 7:19]
-        base_linvel = state[:, 19:22]
-        base_angvel = state[:, 22:25]
-        joint_vel = state[:, 25:37]
+        base_pos = state[:3]
+        base_quat = state[3:7]
+        joint_pos = state[7:19]
+        base_linvel = state[19:22]
+        base_angvel = state[22:25]
+        joint_vel = state[25:37]
         
         # Set qpos and qvel
         qpos = jnp.concatenate([base_pos, base_quat, joint_pos], axis=-1)
@@ -150,7 +150,7 @@ class MuJoCoGo2Rollout:
     
     def rollout_single(self, x0: jnp.ndarray, U: jnp.ndarray) -> jnp.ndarray:
         """
-        Rollout a single trajectory (non-batched version for clarity).
+        Rollout a single trajectory (non-batched).
         
         Args:
             x0: Initial state (state_dim,)
@@ -158,19 +158,35 @@ class MuJoCoGo2Rollout:
         Returns:
             X: State trajectory (H+1, state_dim)
         """
-        # Add batch dimension
-        x0_batch = x0[None, :]  # (1, state_dim)
-        U_batch = U[None, :, :]  # (1, H, action_dim)
+        H = U.shape[0]
         
-        # Call batched version
-        X_batch = self(x0_batch, U_batch)  # (1, H+1, state_dim)
+        # Initialize MJX data
+        data = mjx.make_data(self.mjx_model)
+        data = self._set_mjx_state(data, x0)
         
-        # Remove batch dimension
-        return X_batch[0]
+        # Storage for trajectory
+        X = jnp.zeros((H + 1, self.state_dim))
+        X = X.at[0, :].set(x0)
+        
+        # Scan over time to build trajectory
+        def scan_fn(data, action_t):
+            # Step simulation
+            data = self._step(data, action_t)
+            # Extract state
+            state = self._state_from_mjx_data(data)
+            return data, state
+        
+        # Run scan over horizon
+        _, states = lax.scan(scan_fn, data, U)  # (H, state_dim)
+        
+        # Concatenate with initial state
+        X = X.at[1:, :].set(states)
+        
+        return X
     
     def __call__(self, x0: jnp.ndarray, U: jnp.ndarray) -> jnp.ndarray:
         """
-        Batched rollout operator Φ: (x₀, U) → X₁
+        Batched rollout operator Φ: (x₀, U) → X₁ using vmap.
         
         Args:
             x0: Initial states (batch, state_dim)
@@ -182,30 +198,9 @@ class MuJoCoGo2Rollout:
         assert action_dim == self.action_dim
         assert x0.shape == (batch_size, self.state_dim)
         
-        # Initialize MJX data with initial states
-        data = mjx.make_data(self.mjx_model)
-        # Replicate for batch
-        data = jax.tree_map(lambda x: jnp.tile(x, (batch_size,) + (1,) * (x.ndim - 1)), data)
-        data = self._set_mjx_state(data, x0)
-        
-        # Storage for trajectory
-        X = jnp.zeros((batch_size, H + 1, self.state_dim))
-        X = X.at[:, 0, :].set(x0)
-        
-        # Scan over time to build trajectory
-        def scan_fn(data, action_t):
-            # Step simulation
-            data = self._step(data, action_t)
-            # Extract state
-            state = self._state_from_mjx_data(data)
-            return data, state
-        
-        # Run scan over horizon
-        _, states = lax.scan(scan_fn, data, U.transpose(1, 0, 2))  # (H, batch, state_dim)
-        
-        # Reshape and concatenate with initial state
-        states = states.transpose(1, 0, 2)  # (batch, H, state_dim)
-        X = X.at[:, 1:, :].set(states)
+        # Use vmap to batch over the single rollout function
+        batched_rollout = jax.vmap(self.rollout_single, in_axes=(0, 0))
+        X = batched_rollout(x0, U)
         
         return X
 

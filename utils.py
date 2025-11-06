@@ -94,14 +94,14 @@ class ExponentialMovingAverage:
     
     def initialize(self, params: dict):
         """Initialize EMA parameters from model parameters."""
-        self.ema_params = jax.tree_map(lambda x: x.copy(), params)
+        self.ema_params = jax.tree.map(lambda x: x.copy(), params)
     
     def update(self, params: dict):
         """Update EMA parameters with new model parameters."""
         if self.ema_params is None:
             self.initialize(params)
         else:
-            self.ema_params = jax.tree_map(
+            self.ema_params = jax.tree.map(
                 lambda ema, new: self.decay * ema + (1 - self.decay) * new,
                 self.ema_params,
                 params

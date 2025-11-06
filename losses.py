@@ -101,8 +101,8 @@ def conditional_matching_loss(
         X_t,
         t,
         cond=cond,
-        deterministic=False,  # Use dropout during training
-        rngs={'dropout': rng} if rng is not None else None
+        deterministic=rng is None,  # Use dropout during training if RNG provided
+        rngs={'dropout': rng} if rng is not None else {}
     )  # (batch, H, action_dim)
     
     # Rollout to get predicted terminal trajectory

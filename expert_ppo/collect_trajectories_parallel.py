@@ -92,7 +92,12 @@ def main():
     
     # Create inference function
     from brax.training.agents.ppo import networks as ppo_networks
+    from brax.training.acme import running_statistics
     import functools
+    
+    # IMPORTANT: Use the same normalization function used during training
+    # since normalize_observations=True was used in train_brax.py
+    normalize = running_statistics.normalize
     
     make_networks = functools.partial(
         ppo_networks.make_ppo_networks,
@@ -102,7 +107,7 @@ def main():
     network = make_networks(
         observation_size=env.observation_size,
         action_size=env.action_size,
-        preprocess_observations_fn=lambda x, rng=None: x,
+        preprocess_observations_fn=normalize,
     )
     
     make_policy = ppo_networks.make_inference_fn(network)

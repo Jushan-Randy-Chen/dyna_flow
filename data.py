@@ -60,6 +60,7 @@ def load_trajectory_dataset(
     stride: int = 1,
     state_columns: Optional[List[str]] = None,
     max_files: Optional[int] = None,
+    max_windows: Optional[int] = None,
 ) -> TrajectoryDataset:
     """
     Load state-only trajectory dataset from files.
@@ -70,6 +71,7 @@ def load_trajectory_dataset(
         stride: Stride for sliding window extraction
         state_columns: Column names for CSV files
         max_files: Maximum number of files to load
+        max_windows: Maximum number of windows to extract (for memory management)
     
     Returns:
         TrajectoryDataset instance
@@ -94,6 +96,10 @@ def load_trajectory_dataset(
     
     # Load each file
     for filepath in files:
+        if max_windows is not None and len(windows) >= max_windows:
+            print(f"Reached max_windows limit ({max_windows}), stopping data loading")
+            break
+            
         if filepath.endswith(".csv"):
             arr, cond_arr = _load_csv(filepath, state_columns)
         elif filepath.endswith(".npz"):
@@ -107,6 +113,8 @@ def load_trajectory_dataset(
         if isinstance(arr, list):
             # Ragged array of episodes
             for i, traj in enumerate(arr):
+                if max_windows is not None and len(windows) >= max_windows:
+                    break
                 cond_ep = cond_arr[i] if cond_arr is not None else None
                 _extract_windows(traj, cond_ep, horizon, stride, windows, cond_windows)
                 if has_cond is None and cond_ep is not None:
@@ -121,6 +129,8 @@ def load_trajectory_dataset(
         elif arr.ndim == 3:
             # Batched trajectories (N, T, state_dim)
             for i in range(arr.shape[0]):
+                if max_windows is not None and len(windows) >= max_windows:
+                    break
                 cond_ep = cond_arr[i] if cond_arr is not None else None
                 _extract_windows(arr[i], cond_ep, horizon, stride, windows, cond_windows)
                 if has_cond is None and cond_ep is not None:
@@ -130,10 +140,20 @@ def load_trajectory_dataset(
     if len(windows) == 0:
         raise RuntimeError("No trajectory windows found. Check paths and horizon.")
     
-    # Stack windows
+    # Limit total windows if specified
+    if max_windows is not None and len(windows) > max_windows:
+        windows = windows[:max_windows]
+        if cond_windows:
+            cond_windows = cond_windows[:max_windows]
+    
+    # Stack windows - ensure proper dtype
+    # Convert all windows to numpy arrays first to avoid object dtype
+    windows = [np.asarray(w, dtype=np.float32) for w in windows]
     data = np.stack(windows, axis=0)  # (N, H+1, state_dim)
+    
     cond_data = None
     if has_cond and len(cond_windows) > 0:
+        cond_windows = [np.asarray(c, dtype=np.float32) for c in cond_windows]
         cond_data = np.stack(cond_windows, axis=0)  # (N, cond_dim)
     
     return TrajectoryDataset(data=data, cond_data=cond_data)
@@ -160,29 +180,43 @@ def _load_npy(filepath: str) -> Tuple[np.ndarray, Optional[np.ndarray]]:
 def _load_npz(filepath: str) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """Load trajectories from NPZ file (supports DDAT-style format)."""
     data = np.load(filepath, allow_pickle=True)
-    
-    # Check for standard DynaFlow format
-    if "trajectories" in data:
-        traj_data = data["trajectories"]
-        cond_data = data.get("conds", None)
+
+    # Check for parallel collection format (states + conditionings)
+    if "states" in data and "conditionings" in data:
+        traj_data = data["states"]
+        cond_data = data["conditionings"]
         
         # Handle object arrays (ragged)
         if isinstance(traj_data, np.ndarray) and traj_data.dtype == object:
             traj_list = [np.asarray(t, dtype=np.float32) for t in traj_data]
-            if cond_data is not None:
+            if cond_data is not None and isinstance(cond_data, np.ndarray) and cond_data.dtype == object:
                 cond_list = [np.asarray(c, dtype=np.float32) for c in cond_data]
+            elif cond_data is not None:
+                cond_list = [np.asarray(cond_data, dtype=np.float32)]
             else:
                 cond_list = None
             return traj_list, cond_list
         else:
-            return traj_data.astype(np.float32), cond_data.astype(np.float32) if cond_data is not None else None
+            traj_converted = np.asarray(traj_data, dtype=np.float32)
+            cond_converted = np.asarray(cond_data, dtype=np.float32) if cond_data is not None else None
+            return traj_converted, cond_converted
+    
+    # # Check for states-only format
+    # if "states" in data:
+    #     traj_data = data["states"]
+    #     if isinstance(traj_data, np.ndarray) and traj_data.dtype == object:
+    #         traj_list = [np.asarray(t, dtype=np.float32) for t in traj_data]
+    #         return traj_list, None
+    #     else:
+    #         return np.asarray(traj_data, dtype=np.float32), None
     
     # Fallback: use first key
     key = list(data.keys())[0]
     arr = data[key]
     if isinstance(arr, np.ndarray) and arr.dtype == object:
-        return list(arr), None
-    return arr.astype(np.float32), None
+        arr_list = [np.asarray(item, dtype=np.float32) for item in arr]
+        return arr_list, None
+    return np.asarray(arr, dtype=np.float32), None
 
 
 def _extract_windows(
@@ -194,6 +228,12 @@ def _extract_windows(
     cond_windows: List
 ):
     """Extract sliding windows from a single trajectory."""
+    # Ensure trajectory is a numpy array with proper dtype
+    if not isinstance(traj, np.ndarray):
+        traj = np.asarray(traj, dtype=np.float32)
+    elif traj.dtype == object or traj.dtype != np.float32:
+        traj = np.asarray(traj, dtype=np.float32)
+    
     T = traj.shape[0]
     H1 = horizon + 1
     
@@ -202,11 +242,17 @@ def _extract_windows(
     
     for s in range(0, T - H1 + 1, stride):
         window = traj[s:s + H1]
+        # Ensure window is properly typed
+        window = np.asarray(window, dtype=np.float32)
         windows.append(window)
         
         if cond_traj is not None:
             # Use conditioning at window start time
             cond_window = cond_traj[s]
+            if not isinstance(cond_window, np.ndarray):
+                cond_window = np.asarray(cond_window, dtype=np.float32)
+            elif cond_window.dtype == object or cond_window.dtype != np.float32:
+                cond_window = np.asarray(cond_window, dtype=np.float32)
             cond_windows.append(cond_window)
 
 

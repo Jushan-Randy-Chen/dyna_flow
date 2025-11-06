@@ -20,6 +20,11 @@ def modulate(x: jnp.ndarray, shift: jnp.ndarray, scale: jnp.ndarray) -> jnp.ndar
     return x * (1 + scale[:, None, :]) + shift[:, None, :]
 
 
+def mish(x: jnp.ndarray) -> jnp.ndarray:
+    """Mish activation: x * tanh(softplus(x)) = x * tanh(ln(1 + e^x))"""
+    return x * jnp.tanh(nn.softplus(x))
+
+
 class SinusoidalPosEmb(nn.Module):
     """Sinusoidal positional embeddings for sequence positions."""
     
@@ -55,13 +60,17 @@ class TimeEmbedding(nn.Module):
             Time embeddings (batch, dim)
         """
         x = nn.Dense(self.dim)(t)
-        x = nn.silu(x)  # Mish approximated with SiLU for simplicity
+        x = mish(x)  # Exact match to PyTorch nn.Mish()
         x = nn.Dense(self.dim)(x)
         return x
 
 
 class ContinuousCondEmbedder(nn.Module):
-    """Embed continuous conditioning attributes using attention."""
+    """Embed continuous conditioning attributes using attention.
+    
+    Modified from PyTorch reference to embed continuous variables.
+    Matches the implementation from DiT/DiT.py.
+    """
     
     attr_dim: int
     hidden_size: int
@@ -75,12 +84,13 @@ class ContinuousCondEmbedder(nn.Module):
         Returns:
             Embedding (batch, hidden_size)
         """
-        # Embed each attribute dimension
-        emb = nn.Dense(128)(attr)  # (batch, attr_dim) -> (batch, 128*attr_dim) then reshape
+        # Project each attribute dimension: (batch, attr_dim) -> (batch, attr_dim * 128)
+        # Then reshape to (batch, attr_dim, 128)
+        emb = nn.Dense(self.attr_dim * 128)(attr)  # (batch, attr_dim * 128)
         emb = emb.reshape((-1, self.attr_dim, 128))  # (batch, attr_dim, 128)
         
         if mask is not None:
-            emb = emb * mask[..., None]
+            emb = emb * mask[:, :, None]
         
         # Self-attention over attribute dimensions
         emb = nn.MultiHeadDotProductAttention(
@@ -89,9 +99,9 @@ class ContinuousCondEmbedder(nn.Module):
             deterministic=True
         )(emb, emb)  # (batch, attr_dim, 128)
         
-        # Flatten and project to hidden size
-        emb = emb.reshape((-1, self.attr_dim * 128))
-        return nn.Dense(self.hidden_size)(emb)
+        # Flatten and project to hidden size (matches PyTorch version)
+        emb = emb.reshape((-1, self.attr_dim * 128))  # (batch, attr_dim * 128)
+        return nn.Dense(self.hidden_size)(emb)  # (batch, hidden_size)
 
 
 class DiTBlock(nn.Module):
@@ -118,7 +128,7 @@ class DiTBlock(nn.Module):
         )
         
         # Multi-head self-attention with adaLN
-        norm_x = nn.LayerNorm(use_bias=False, use_scale=False)(x)
+        norm_x = nn.LayerNorm(use_bias=False, use_scale=False, epsilon=1e-6)(x)
         mod_x = modulate(norm_x, shift_msa, scale_msa)
         attn_out = nn.MultiHeadDotProductAttention(
             num_heads=self.n_heads,
@@ -129,10 +139,10 @@ class DiTBlock(nn.Module):
         x = x + gate_msa[:, None, :] * attn_out
         
         # MLP with adaLN
-        norm_x2 = nn.LayerNorm(use_bias=False, use_scale=False)(x)
+        norm_x2 = nn.LayerNorm(use_bias=False, use_scale=False, epsilon=1e-6)(x)
         mod_x2 = modulate(norm_x2, shift_mlp, scale_mlp)
         mlp_out = nn.Dense(self.hidden_size * 4)(mod_x2)
-        mlp_out = nn.gelu(mlp_out, approximate=True)
+        mlp_out = nn.gelu(mlp_out, approximate=True)  # GELU with tanh approximation
         mlp_out = nn.Dropout(rate=self.dropout, deterministic=deterministic)(mlp_out)
         mlp_out = nn.Dense(self.hidden_size)(mlp_out)
         x = x + gate_mlp[:, None, :] * mlp_out
@@ -158,7 +168,7 @@ class FinalLayer1d(nn.Module):
         modulation = nn.Dense(self.hidden_size * 2)(nn.silu(t))
         shift, scale = jnp.split(modulation, 2, axis=-1)
         
-        norm_x = nn.LayerNorm(use_bias=False, use_scale=False)(x)
+        norm_x = nn.LayerNorm(use_bias=False, use_scale=False, epsilon=1e-6)(x)
         mod_x = modulate(norm_x, shift, scale)
         return nn.Dense(self.out_dim, kernel_init=nn.initializers.zeros)(mod_x)
 
@@ -317,7 +327,9 @@ def create_action_predictor(
     dummy_t = jnp.ones((1, 1))
     dummy_cond = jnp.ones((1, cond_dim)) if cond_dim else None
     
-    params = model.init(rng, dummy_X_t, dummy_t, cond=dummy_cond, deterministic=True)
+    # Split RNG for params and dropout
+    init_rng, dropout_rng = random.split(rng)
+    params = model.init({'params': init_rng, 'dropout': dropout_rng}, dummy_X_t, dummy_t, cond=dummy_cond, deterministic=True)
     
     return model, params
 
