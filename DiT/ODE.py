@@ -16,7 +16,7 @@ from tqdm import tqdm
 from copy import deepcopy
 
 from DiT.DiT import DiT1d, count_parameters
-from utils.utils import Normalizer
+from utils import Normalizer
 
 
 

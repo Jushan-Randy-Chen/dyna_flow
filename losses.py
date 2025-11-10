@@ -67,6 +67,7 @@ def conditional_matching_loss(
     t: jnp.ndarray,
     cond: Optional[jnp.ndarray] = None,
     weight_mask: Optional[jnp.ndarray] = None,
+    dim_weights: Optional[jnp.ndarray] = None,
     rng: Optional[jax.random.PRNGKey] = None
 ) -> Tuple[jnp.ndarray, dict]:
     """
@@ -88,6 +89,7 @@ def conditional_matching_loss(
         t: Time values (batch, 1)
         cond: Optional conditioning (batch, cond_dim)
         weight_mask: Optional element-wise weights (batch, H+1, state_dim)
+        dim_weights: Optional per-dimension weights (state_dim,) for inverse variance weighting
         rng: Optional random key for dropout
     Returns:
         (loss, aux_dict) where aux_dict contains x1_hat for monitoring
@@ -109,10 +111,17 @@ def conditional_matching_loss(
     x0_initial = x0[:, 0, :]  # (batch, state_dim) - use initial state
     X1_hat = rollout_fn(x0_initial, U_hat)  # (batch, H+1, state_dim)
     
-    # Default weight mask: uniform except ignore the initial state
+    # Default weight mask:
+    # - First state (t=0): weight 0.0 (preserved, no loss)
+    # - Rest of states: weight 1.0
     if weight_mask is None:
         weight_mask = jnp.ones_like(X1_hat)
-        weight_mask = weight_mask.at[:, 0, :].set(0.0)
+        weight_mask = weight_mask.at[:, 0, :].set(0.0)  # No loss on first state
+    
+    # Apply per-dimension inverse variance weighting if provided
+    if dim_weights is not None:
+        weight_mask = weight_mask * dim_weights[None, None, :]  # Broadcast (state_dim,) to (batch, H+1, state_dim)
+        
     
     # Compute weighted MSE loss
     diff = X1_hat - x1_demo

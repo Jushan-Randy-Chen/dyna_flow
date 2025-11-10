@@ -183,7 +183,7 @@ class DiT1d(nn.Module):
     x_dim: int
     d_model: int = 384
     n_heads: int = 6
-    depth: int = 3
+    depth: int = 6
     dropout: float = 0.1
     attr_dim: Optional[int] = None
     
@@ -291,7 +291,7 @@ def create_action_predictor(
     action_dim: int,
     d_model: int = 384,
     n_heads: int = 6,
-    depth: int = 3,
+    depth: int = 6,
     cond_dim: Optional[int] = None,
     rng: Optional[jax.random.PRNGKey] = None
 ) -> tuple:

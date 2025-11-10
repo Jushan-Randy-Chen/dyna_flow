@@ -37,6 +37,53 @@ def normalize_quat(x: jnp.ndarray) -> jnp.ndarray:
     return x.at[..., 3:7].set(quat / norm)
 
 
+def compute_normalization_stats(trajectories: jnp.ndarray) -> dict:
+    """Compute global mean and std per state dimension (matching ODE.py Normalizer).
+    
+    Args:
+        trajectories: (N, H+1, state_dim) array of trajectory windows
+    Returns:
+        Dictionary with 'mean' and 'std' arrays of shape (state_dim,)
+    """
+    # Compute mean/std over batch and time dimensions (0, 1), matching PyTorch Normalizer
+    # PyTorch: x.mean(dim=(0,1)), x.std(dim=(0,1))
+    mean = jnp.mean(trajectories, axis=(0, 1))
+    std = jnp.std(trajectories, axis=(0, 1), ddof=1)  # Use Bessel's correction to match PyTorch
+    std = jnp.clip(std, min=1e-6)  # Avoid division by zero
+    
+    return {'mean': mean, 'std': std}
+
+
+def normalize_states(x: jnp.ndarray, stats: dict) -> jnp.ndarray:
+    """Apply z-score normalization then renormalize quaternions.
+    
+    Args:
+        x: State trajectories (..., state_dim)
+        stats: Dictionary with 'mean' and 'std'
+    Returns:
+        Normalized states
+    """
+    # Apply z-score normalization
+    x_norm = (x - stats['mean']) / stats['std']
+    
+    # Re-normalize quaternion component (indices 3:7)
+    x_norm = normalize_quat(x_norm)
+    
+    return x_norm
+
+
+def denormalize_states(x_norm: jnp.ndarray, stats: dict) -> jnp.ndarray:
+    """Reverse z-score normalization (for logging/visualization).
+    
+    Args:
+        x_norm: Normalized states (..., state_dim)
+        stats: Dictionary with 'mean' and 'std'
+    Returns:
+        Original scale states
+    """
+    return x_norm * stats['std'] + stats['mean']
+
+
 def create_train_state(
     rng: jax.Array,
     state_dim: int,
@@ -46,21 +93,24 @@ def create_train_state(
     horizon: int,
     ema_decay: Optional[float] = None,
 ) -> Tuple[Any, Any, optax.GradientTransformation, optax.OptState, Optional[Any]]:
-    """Create model and optimizer."""
+    """Create model and optimizer (matching ODE.py: constant LR, no schedule)."""
     
-    # Initialize model
+    # Initialize model 
     model, params = create_action_predictor(
         state_dim=state_dim,
         action_dim=action_dim,
         d_model=384,
         n_heads=6,
-        depth=3,
+        depth=3, 
         cond_dim=cond_dim,
         rng=rng,
     )
     
-    # Create optimizer
-    optimizer = optax.adamw(learning_rate=learning_rate, weight_decay=1e-4)
+    # Create optimizer with global norm clipping (matching ODE.py - constant LR, no schedule)
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(10.0),  # Match ODE.py gradient clipping
+        optax.adamw(learning_rate=learning_rate, weight_decay=1e-4),  # Match ODE.py: constant lr=2e-4
+    )
     opt_state = optimizer.init(params)
     
     # Initialize EMA parameters if requested
@@ -71,7 +121,7 @@ def create_train_state(
     return model, params, optimizer, opt_state, ema_params
 
 
-@partial(jax.jit, static_argnames=('model_fn', 'rollout_op', 'ema_decay', 'optimizer'))
+@partial(jax.jit, static_argnames=('model_fn', 'rollout_op', 'ema_decay', 'optimizer', 'use_dim_weights'))
 def train_step(
     model_fn: Any,
     rollout_op: MuJoCoGo2Rollout,
@@ -81,41 +131,59 @@ def train_step(
     x1_demo: jnp.ndarray,
     cond: Optional[jnp.ndarray],
     rng: jax.Array,
+    norm_stats: dict,
+    dim_weights: Optional[jnp.ndarray] = None,
+    use_dim_weights: bool = False,
     ema_params: Optional[Any] = None,
     ema_decay: Optional[float] = None,
-) -> Tuple[Any, optax.OptState, float, float, jax.Array, Optional[Any]]:
-    """Single training step with optional EMA update."""
+) -> Tuple[Any, optax.OptState, float, float, jax.Array, Optional[Any], jnp.ndarray]:
+    """Single training step with optional EMA update and per-dim MSE logging."""
     
     def loss_fn(params_in):
-        # Sample x0 ~ p0 (perturbed expert with noise)
-        std = x1_demo.std(axis=(1, 2), keepdims=True).clip(min=1e-3)
-        noise_key, t_key, dropout_key = random.split(rng, 3)
-        noise = random.normal(noise_key, x1_demo.shape) * std * 0.1
-        x0 = x1_demo + noise
-        x0 = x0.at[:, 0, :].set(x1_demo[:, 0, :])  # Keep initial state
-        x0 = normalize_quat(x0)
+        # Normalize x1_demo
+        x1_norm = normalize_states(x1_demo, norm_stats)
+        
+        # Sample x0 ~ N(0, I) for flow matching base distribution
+        noise_key, t_key, dropout_key, cond_mask_key = random.split(rng, 4)
+        
+        # x0 is pure Gaussian noise (standard flow matching)
+        x0 = random.normal(noise_key, x1_norm.shape)
+        # Preserve first state exactly (conditioned on initial observation)
+        x0 = x0.at[:, 0, :].set(x1_norm[:, 0, :])
+        x0 = normalize_quat(x0)  # Re-normalize quaternions
+        
+        # # Apply 20% attribute dropout during training (matching ODE.py)
+        # if cond is not None:
+        #     # mask = (torch.rand(*condition.shape) > 0.2).int() from ODE.py
+        #     cond_mask = (random.uniform(cond_mask_key, cond.shape) > 0.2).astype(jnp.float32)
+        #     cond_masked = cond * cond_mask
+        # else:
+        #     cond_masked = None
         
         # Sample t ~ U(0,1)
         t = random.uniform(t_key, (x1_demo.shape[0], 1), minval=0.0, maxval=1.0)
         
-        # Compute loss with dropout RNG
-        loss, x1_hat = conditional_matching_loss(
-            model_fn, params_in, rollout_op, x0, x1_demo, t, cond=cond, rng=dropout_key
+        # Compute loss with dropout RNG and optional dimension weights
+        loss, aux_dict = conditional_matching_loss(
+            model_fn, params_in, rollout_op, x0, x1_norm, t, 
+            cond=cond, dim_weights=dim_weights, rng=dropout_key
         )
         
-        return loss
+        return loss, aux_dict
     
     # Compute gradients
-    loss, grads = jax.value_and_grad(loss_fn)(params)
+    (loss, aux_dict), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    
+    # Extract x1_hat from aux dict and compute per-dimension MSE for diagnostics
+    x1_norm = normalize_states(x1_demo, norm_stats)
+    x1_hat = aux_dict['x1_hat']
+    per_dim_mse = jnp.mean((x1_hat - x1_norm) ** 2, axis=(0, 1))  # Shape: (state_dim,)
     
     # Compute gradient norm for monitoring
-    grad_norm = jnp.sqrt(sum(jnp.sum(g**2) for g in jax.tree.leaves(grads)))
+    grad_norm = jnp.sqrt(sum(jnp.sum(g**2) for g in jax.tree.leaves(grads))) #this is the pre-clipped grad norm
     
-    # Clip gradients
-    grads = jax.tree.map(lambda g: jnp.clip(g, -1.0, 1.0), grads)
-    
-    # Update parameters
-    updates, opt_state = optimizer.update(grads, opt_state, params)
+    # Update parameters (optimizer now includes gradient clipping)
+    updates, opt_state = optimizer.update(grads, opt_state, params) 
     params = optax.apply_updates(params, updates)
     
     # Update EMA parameters if enabled
@@ -126,7 +194,7 @@ def train_step(
             params
         )
     
-    return params, opt_state, loss, grad_norm, rng, ema_params
+    return params, opt_state, loss, grad_norm, rng, ema_params, per_dim_mse
 
 
 def main():
@@ -146,14 +214,14 @@ def main():
         help="Path to MuJoCo XML model",
     )
     parser.add_argument("--horizon", type=int, default=10, help="Trajectory horizon")
-    parser.add_argument("--batch", type=int, default=256, help="Batch size")
-    parser.add_argument("--epochs", type=int, default=500, help="Training epochs")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--batch", type=int, default=128, help="Batch size")
+    parser.add_argument("--epochs", type=int, default=200, help="Training epochs")
+    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate (ODE.py uses 2e-4)")
     parser.add_argument(
         "--stride",
         type=int,
-        default=5,
-        help="Stride for sliding window extraction (default: 5, reduces memory)",
+        default=11, #ensures no overlap for horizon=10
+        help="Stride for sliding window extraction (default: 10, reduces memory)",
     )
     parser.add_argument(
         "--save",
@@ -172,7 +240,7 @@ def main():
         "--ema-decay",
         type=float,
         default=0.995,
-        help="EMA decay rate (0 to disable, typical: 0.995-0.9999)",
+        help="EMA decay rate (0 to disable)",
     )
     parser.add_argument(
         "--log-interval",
@@ -191,6 +259,17 @@ def main():
         type=int,
         default=None,
         help="Maximum number of episodes to load (for memory management)",
+    )
+    parser.add_argument(
+        "--use-dim-weights",
+        action="store_true",
+        help="Enable inverse variance weighting per dimension (adaptive based on per_dim_mse)",
+    )
+    parser.add_argument(
+        "--dim-weight-warmup",
+        type=int,
+        default=100,
+        help="Number of steps before computing dimension weights (default: 100)",
     )
     
     # Weights & Biases
@@ -260,6 +339,20 @@ def main():
     print(f"✓ Dataset on GPU: {all_trajectories.devices()}")
     print(f"  Memory: {all_trajectories.nbytes / 1e9:.2f} GB")
     
+    # Compute normalization statistics (matching ODE.py)
+    print("\nComputing normalization statistics...")
+    norm_stats = compute_normalization_stats(all_trajectories)
+    
+    # Compute sigma_data: global std of normalized data (matching ODE.py)
+    normalized_trajs = normalize_states(all_trajectories, norm_stats)
+    sigma_data = float(jnp.std(normalized_trajs))
+    norm_stats['sigma_data'] = sigma_data
+    
+    print(f"✓ Normalization stats computed")
+    print(f"  Mean: min={float(norm_stats['mean'].min()):.3f}, max={float(norm_stats['mean'].max()):.3f}")
+    print(f"  Std:  min={float(norm_stats['std'].min()):.3f}, max={float(norm_stats['std'].max()):.3f}")
+    print(f"  sigma_data (global): {sigma_data:.3f}")
+    
     # Setup rollout operator
     print("\nInitializing rollout operator...")
     rollout = MuJoCoGo2Rollout(xml_path=args.xml_path, dt=0.02)
@@ -270,6 +363,7 @@ def main():
     print("\nInitializing model...")
     rng, init_rng = random.split(rng)
     ema_decay = args.ema_decay if args.ema_decay > 0 else None
+    
     model, params, optimizer, opt_state, ema_params = create_train_state(
         rng=init_rng,
         state_dim=state_dim,
@@ -281,6 +375,7 @@ def main():
     )
     print(f"✓ Model initialized")
     print(f"  Parameters: {count_parameters(params)}")
+    print(f"  Learning rate: {args.lr} (constant, matching ODE.py)")
     if ema_params is not None:
         print(f"  EMA enabled with decay={ema_decay}")
     
@@ -303,6 +398,8 @@ def main():
                     "action_dim": action_dim,
                     "cond_dim": cond_dim,
                     "n_samples": n_samples,
+                    "use_dim_weights": args.use_dim_weights,
+                    "dim_weight_warmup": args.dim_weight_warmup,
                 },
             )
             print("✓ W&B initialized")
@@ -316,6 +413,14 @@ def main():
     
     global_step = 0
     steps_per_epoch = n_samples // args.batch
+    
+    # Initialize dimension weights tracking
+    dim_weights = None
+    cumulative_per_dim_mse = None
+    mse_count = 0
+    
+    if args.use_dim_weights:
+        print(f"Inverse variance weighting enabled (warmup: {args.dim_weight_warmup} steps)")
     
     epoch_bar = tqdm(range(args.epochs), desc="Epochs")
     
@@ -341,12 +446,9 @@ def main():
             x1_demo = all_trajectories[batch_indices]
             cond = all_conds[batch_indices] if all_conds is not None else None
             
-            # Normalize quaternions
-            x1_demo = normalize_quat(x1_demo)
-            
-            # Training step
+            # Training step (note: normalization happens inside train_step now)
             rng, step_rng = random.split(rng)
-            params, opt_state, loss, grad_norm, _, ema_params = train_step(
+            params, opt_state, loss, grad_norm, _, ema_params, per_dim_mse = train_step(
                 model_fn=model.apply,
                 rollout_op=rollout,
                 params=params,
@@ -355,9 +457,41 @@ def main():
                 x1_demo=x1_demo,
                 cond=cond,
                 rng=step_rng,
+                norm_stats=norm_stats,
+                dim_weights=dim_weights,
+                use_dim_weights=args.use_dim_weights,
                 ema_params=ema_params,
                 ema_decay=ema_decay,
             )
+            
+            # Accumulate per-dimension MSE for computing weights
+            if args.use_dim_weights:
+                if cumulative_per_dim_mse is None:
+                    cumulative_per_dim_mse = per_dim_mse
+                else:
+                    cumulative_per_dim_mse = cumulative_per_dim_mse + per_dim_mse
+                mse_count += 1
+                
+                # Compute dimension weights after warmup period
+                if global_step == args.dim_weight_warmup and mse_count > 0:
+                    avg_per_dim_mse = cumulative_per_dim_mse / mse_count
+                    # Inverse variance weighting: dimensions with higher MSE get lower weight
+                    dim_weights = 1.0 / (avg_per_dim_mse + 1e-6)
+                    # Normalize so mean weight is 1.0
+                    dim_weights = dim_weights / dim_weights.mean()
+                    print(f"\n✓ Dimension weights computed at step {global_step}")
+                    print(f"  Weight range: [{float(dim_weights.min()):.3f}, {float(dim_weights.max()):.3f}]")
+                    
+                    # Log to W&B
+                    if wandb_run:
+                        try:
+                            dim_weight_dict = {
+                                f"dim_weights/dim_{i}": float(dim_weights[i])
+                                for i in range(min(state_dim, 10))
+                            }
+                            wandb.log(dim_weight_dict, step=global_step)
+                        except Exception:
+                            pass
             
             # Convert JAX arrays to Python floats for logging
             loss = float(loss)
@@ -381,6 +515,14 @@ def main():
                         },
                         step=global_step,
                     )
+                    
+                    # Log per-dimension MSE periodically (every 100 steps)
+                    if global_step % 100 == 0:
+                        per_dim_dict = {
+                            f"train/mse_dim_{i}": float(per_dim_mse[i])
+                            for i in range(min(state_dim, 10))  # Log first 10 dims to avoid clutter
+                        }
+                        wandb.log(per_dim_dict, step=global_step)
                 except Exception:
                     pass
             
@@ -418,6 +560,9 @@ def main():
                 'horizon': args.horizon,
                 'cond_dim': cond_dim if cond_dim is not None else -1,
                 'epoch': epoch + 1,
+                'norm_mean': np.array(norm_stats['mean']),
+                'norm_std': np.array(norm_stats['std']),
+                'sigma_data': norm_stats['sigma_data'],
             }
             
             if ema_params is not None:
@@ -448,6 +593,9 @@ def main():
         'action_dim': action_dim,
         'horizon': args.horizon,
         'cond_dim': cond_dim if cond_dim is not None else -1,
+        'norm_mean': np.array(norm_stats['mean']),
+        'norm_std': np.array(norm_stats['std']),
+        'sigma_data': norm_stats['sigma_data'],
     }
     
     # Also save regular params and EMA separately if EMA was used
@@ -478,44 +626,13 @@ if __name__ == "__main__":
 
 """
 Usage Examples:
-
-# Basic training (memory-efficient defaults):
-python train_flow_matching.py --data logs/ppo_policy2/trajectories/trajectories.npz
-
-# Limit memory usage for large datasets:
-python train_flow_matching.py \\
-    --data logs/ppo_policy2/trajectories/trajectories.npz \\
-    --max-episodes 5000 \\
-    --stride 10 \\
-    --batch 32
-
-# With custom hyperparameters:
-python train_flow_matching.py \\
-    --data logs/ppo_policy2/trajectories/trajectories.npz \\
-    --horizon 10 \\
-    --batch 64 \\
-    --epochs 500 \\
-    --lr 3e-4
-
-# With stronger EMA (more stable, smoother):
-python train_flow_matching.py \\
-    --data logs/ppo_policy2/trajectories/trajectories.npz \\
-    --ema-decay 0.999
-
-# Disable EMA:
-python train_flow_matching.py \\
-    --data logs/ppo_policy2/trajectories/trajectories.npz \\
-    --ema-decay 0
-
-# With W&B logging:
-python train_flow_matching.py \\
-    --data logs/ppo_policy2/trajectories/trajectories.npz \\
-    --wandb online \\
+python train_flow_matching.py \
+    --data logs/ppo_policy2/trajectories/trajectories.npz \
+    --use-dim-weights \
+    --dim-weight-warmup 100 \
+    --wandb online \
     --wandb-project dynaflow-go2
 
-# Multiple data sources:
-python train_flow_matching.py \\
-    --data logs/ppo_policy/trajectories logs/ppo_policy2/trajectories
 
 Memory Management Tips:
 - Use --stride 5-10 to reduce sliding window density
