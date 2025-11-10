@@ -5,9 +5,11 @@ Utility functions for DynaFlow: checkpointing, EMA, normalization, etc.
 import jax
 import jax.numpy as jnp
 import pickle
+import numpy as np
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from flax.training import checkpoints
+from flax import serialization
 import optax
 
 
@@ -75,6 +77,74 @@ def load_checkpoint(load_path: str) -> dict:
     
     print(f"Checkpoint loaded from {load_path}")
     return checkpoint
+
+
+def load_npz_checkpoint(
+    checkpoint_path: str,
+    use_ema: bool = True
+) -> Tuple[Dict[str, Any], Any]:
+    """
+    Load checkpoint from NPZ file (as saved by train_flow_matching.py).
+    
+    Args:
+        checkpoint_path: Path to .npz checkpoint file
+        use_ema: Whether to use EMA parameters (if available)
+    
+    Returns:
+        metadata: Dict with state_dim, action_dim, horizon, cond_dim
+        params: Deserialized model parameters (as Flax pytree)
+    
+    Example:
+        >>> metadata, params = load_npz_checkpoint('logs/model_epoch50.npz')
+        >>> # Create model with metadata
+        >>> model, init_params = create_action_predictor(
+        ...     state_dim=metadata['state_dim'],
+        ...     action_dim=metadata['action_dim'],
+        ...     cond_dim=metadata['cond_dim'],
+        ...     rng=jax.random.PRNGKey(0)
+        ... )
+        >>> # params now contains trained weights ready for inference
+    """
+    # Load NPZ file
+    checkpoint = np.load(checkpoint_path, allow_pickle=True)
+    
+    # Extract metadata
+    metadata = {
+        'state_dim': int(checkpoint['state_dim']),
+        'action_dim': int(checkpoint['action_dim']),
+        'horizon': int(checkpoint['horizon']),
+        'cond_dim': int(checkpoint['cond_dim']) if checkpoint['cond_dim'] != -1 else None,
+    }
+    
+    if 'epoch' in checkpoint:
+        metadata['epoch'] = int(checkpoint['epoch'])
+    
+    # Choose which parameters to load
+    if use_ema and 'model' in checkpoint:
+        model_bytes = checkpoint['model'].tobytes()
+        param_type = 'EMA' if 'ema_decay' in checkpoint else 'regular'
+    elif 'model_regular' in checkpoint:
+        model_bytes = checkpoint['model_regular'].tobytes()
+        param_type = 'regular'
+    elif 'model' in checkpoint:
+        model_bytes = checkpoint['model'].tobytes()
+        param_type = 'saved'
+    else:
+        raise ValueError("No model parameters found in checkpoint!")
+    
+    print(f"✓ Loaded checkpoint from {checkpoint_path}")
+    print(f"  State dim: {metadata['state_dim']}")
+    print(f"  Action dim: {metadata['action_dim']}")
+    print(f"  Horizon: {metadata['horizon']}")
+    print(f"  Cond dim: {metadata['cond_dim']}")
+    if 'epoch' in metadata:
+        print(f"  Epoch: {metadata['epoch']}")
+    print(f"  Using {param_type} parameters")
+    
+    # Return metadata and raw bytes (user must deserialize with model structure)
+    metadata['model_bytes'] = model_bytes
+    
+    return metadata, model_bytes
 
 
 class ExponentialMovingAverage:

@@ -14,7 +14,7 @@ from typing import Optional, Tuple, Any
 
 # Configure JAX memory allocation BEFORE importing jax
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.7'  # Use only 70% of GPU memory
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.8' # Use only 80% of GPU memory
 
 import jax
 import jax.numpy as jnp
@@ -146,7 +146,7 @@ def main():
         help="Path to MuJoCo XML model",
     )
     parser.add_argument("--horizon", type=int, default=10, help="Trajectory horizon")
-    parser.add_argument("--batch", type=int, default=64, help="Batch size")
+    parser.add_argument("--batch", type=int, default=256, help="Batch size")
     parser.add_argument("--epochs", type=int, default=500, help="Training epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument(
@@ -160,6 +160,12 @@ def main():
         type=str,
         default="logs/dynaflow_jax.npz",
         help="Model save path",
+    )
+    parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=50,
+        help="Save checkpoint every N epochs (default: 50)",
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument(
@@ -243,6 +249,17 @@ def main():
     print(f"  Cond dim: {cond_dim}")
     print(f"  Horizon: {dataset.horizon}")
     
+    # Pre-load entire dataset to GPU for faster training
+    # This eliminates CPU→GPU transfer bottleneck on every training step
+    # If you get OOM, reduce --max-episodes or --stride to limit dataset size
+    print("\nTransferring dataset to GPU...")
+    all_indices = np.arange(n_samples)
+    all_data = dataset.get_batch(all_indices)
+    all_trajectories = jnp.array(all_data['trajectories'])  # Transfer once to GPU
+    all_conds = jnp.array(all_data['cond']) if 'cond' in all_data else None
+    print(f"✓ Dataset on GPU: {all_trajectories.devices()}")
+    print(f"  Memory: {all_trajectories.nbytes / 1e9:.2f} GB")
+    
     # Setup rollout operator
     print("\nInitializing rollout operator...")
     rollout = MuJoCoGo2Rollout(xml_path=args.xml_path, dt=0.02)
@@ -315,14 +332,14 @@ def main():
         )
         
         for step in batch_bar:
-            # Get batch
+            # Get batch - use GPU-resident data!
             batch_start = step * args.batch
             batch_end = batch_start + args.batch
             batch_indices = indices[batch_start:batch_end]
             
-            batch_data = dataset.get_batch(np.array(batch_indices))
-            x1_demo = jnp.array(batch_data['trajectories'])
-            cond = jnp.array(batch_data['cond']) if 'cond' in batch_data else None
+            # Index directly from GPU arrays (no CPU transfer!)
+            x1_demo = all_trajectories[batch_indices]
+            cond = all_conds[batch_indices] if all_conds is not None else None
             
             # Normalize quaternions
             x1_demo = normalize_quat(x1_demo)
@@ -382,6 +399,33 @@ def main():
                 )
             except Exception:
                 pass
+        
+        # Save checkpoint periodically
+        if (epoch + 1) % args.save_interval == 0:
+            checkpoint_path = args.save.replace('.npz', f'_epoch{epoch+1}.npz')
+            os.makedirs(os.path.dirname(checkpoint_path) or '.', exist_ok=True)
+            
+            from flax import serialization
+            
+            # Save EMA parameters if available
+            ckpt_params = ema_params if ema_params is not None else params
+            model_bytes = serialization.to_bytes(ckpt_params)
+            
+            save_dict = {
+                'model': model_bytes,
+                'state_dim': state_dim,
+                'action_dim': action_dim,
+                'horizon': args.horizon,
+                'cond_dim': cond_dim if cond_dim is not None else -1,
+                'epoch': epoch + 1,
+            }
+            
+            if ema_params is not None:
+                save_dict['model_regular'] = serialization.to_bytes(params)
+                save_dict['ema_decay'] = ema_decay
+            
+            np.savez(checkpoint_path, **save_dict)
+            print(f"  ✓ Checkpoint saved: {checkpoint_path}")
     
     # Save model
     print("\n" + "=" * 80)

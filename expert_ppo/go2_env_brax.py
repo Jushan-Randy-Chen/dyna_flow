@@ -500,7 +500,7 @@ class Go2Env(PipelineEnv):
         # Get joint velocities (12,)
         q_dot = pipeline_state.qd[6:]
         
-        # Concatenate: g (3) + v (3) + ω (3) + q (12) + q̇ (12) + cmd (3) = 36
+        # Concatenate: g (3) + v (3) + ω (3) + q (12) + q̇ (12) + cmd (3) = 36 
         conditioning = jp.concatenate([
             g,              # projected gravity (3)
             v,              # base linear velocity (3)
