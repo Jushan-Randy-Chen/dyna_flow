@@ -23,7 +23,7 @@ class TrajectoryDataset:
     """
     
     data: np.ndarray  # (N, H+1, state_dim)
-    cond_data: Optional[np.ndarray] = None  # (N, cond_dim) if available
+    cond_data: Optional[np.ndarray] = None  # (N, H+1, cond_dim) if available
     
     def __len__(self) -> int:
         return self.data.shape[0]
@@ -154,7 +154,7 @@ def load_trajectory_dataset(
     cond_data = None
     if has_cond and len(cond_windows) > 0:
         cond_windows = [np.asarray(c, dtype=np.float32) for c in cond_windows]
-        cond_data = np.stack(cond_windows, axis=0)  # (N, cond_dim)
+        cond_data = np.stack(cond_windows, axis=0)  # (N, H+1, cond_dim)
     
     return TrajectoryDataset(data=data, cond_data=cond_data)
 
@@ -247,8 +247,8 @@ def _extract_windows(
         windows.append(window)
         
         if cond_traj is not None:
-            # Use conditioning at window start time
-            cond_window = cond_traj[s]
+            # Extract full conditioning window matching the state window
+            cond_window = cond_traj[s:s + H1]
             if not isinstance(cond_window, np.ndarray):
                 cond_window = np.asarray(cond_window, dtype=np.float32)
             elif cond_window.dtype == object or cond_window.dtype != np.float32:

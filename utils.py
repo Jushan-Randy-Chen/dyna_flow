@@ -351,3 +351,30 @@ def get_default_xml_path() -> str:
     raise FileNotFoundError(
         "Could not find Go2 XML model. Please provide xml_path explicitly."
     )
+
+def get_dim_weights(state_dim: int = 37) -> jnp.ndarray:
+    """Get per-dimension weights using inverse std (from analyze_trajectory_stats.py).
+    
+    Computed per-element from trajectory data, with quaternion group-averaged:
+    - Each dimension weighted by std, normalized to mean=1.0
+    - Quaternion (dims 3-6) uses average weight since components are constrained to unit norm
+    
+    Args:
+        state_dim: State dimension (37 for Go2)
+    Returns:
+        Per-dimension weights (state_dim,) normalized to mean=1.0
+    """
+    # Per-element inverse std weights (quaternion group-averaged)
+    weights = jnp.array([
+        0.0776, 0.0586, 14.9517, 2.8613, 2.8613,
+        2.8613, 2.8613, 1.1261, 0.6570, 0.4792,
+        0.8912, 0.3679, 0.6017, 0.9117, 0.3759,
+        0.6634, 0.7996, 0.4587, 0.6884, 0.2432,
+        0.1229, 1.2099, 0.1120, 0.1457, 0.2944,
+        0.0532, 0.0310, 0.0230, 0.0308, 0.0161,
+        0.0184, 0.0329, 0.0174, 0.0187, 0.0352,
+        0.0199, 0.0217,
+    ])
+    
+    assert weights.shape[0] == state_dim, f"Expected {state_dim} dims, got {weights.shape[0]}"
+    return weights

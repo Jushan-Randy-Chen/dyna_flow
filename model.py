@@ -291,7 +291,8 @@ def create_action_predictor(
     action_dim: int,
     d_model: int = 384,
     n_heads: int = 6,
-    depth: int = 6,
+    depth: int = 3,
+    horizon: int = 17,
     cond_dim: Optional[int] = None,
     rng: Optional[jax.random.PRNGKey] = None
 ) -> tuple:
@@ -323,7 +324,7 @@ def create_action_predictor(
     )
     
     # Initialize with dummy inputs
-    dummy_X_t = jnp.ones((1, 17, state_dim))  # H+1 = 17 for horizon 16
+    dummy_X_t = jnp.ones((1, horizon, state_dim))  # H+1 = 17 for horizon 16
     dummy_t = jnp.ones((1, 1))
     dummy_cond = jnp.ones((1, cond_dim)) if cond_dim else None
     

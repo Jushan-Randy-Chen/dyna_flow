@@ -43,14 +43,42 @@ def compute_normalization_stats(trajectories: jnp.ndarray) -> dict:
     Args:
         trajectories: (N, H+1, state_dim) array of trajectory windows
     Returns:
-        Dictionary with 'mean' and 'std' arrays of shape (state_dim,)
+        Dictionary with 'mean' and 'std' arrays of shape (state_dim,) 
     """
-    # Compute mean/std over batch and time dimensions (0, 1), matching PyTorch Normalizer
-    # PyTorch: x.mean(dim=(0,1)), x.std(dim=(0,1))
-    mean = jnp.mean(trajectories, axis=(0, 1))
-    std = jnp.std(trajectories, axis=(0, 1), ddof=1)  # Use Bessel's correction to match PyTorch
-    std = jnp.clip(std, min=1e-6)  # Avoid division by zero
+    # Exclude quaternion components from z-score statistics.
+    # We compute mean/std over batch and time for non-quaternion dims and
+    # set quaternion dims' mean=0, std=1 so they are left unchanged by z-score.
+    # This preserves the unit-norm manifold structure of quaternions.
+    D = trajectories.shape[-1]
+    idx = jnp.arange(D)
+    non_quat_mask = jnp.logical_or(idx < 3, idx >= 7)  # True for dims to normalize
+
+    # Select non-quaternion channels and compute stats there
+    sel = trajectories[..., non_quat_mask]
+    mean_sel = jnp.mean(sel, axis=(0, 1))
+    std_sel = jnp.std(sel, axis=(0, 1), ddof=1)
+    std_sel = jnp.clip(std_sel, a_min=1e-6)
+
+    # Build full mean/std arrays where quaternion dims have mean=0 and std=1
+    mean = jnp.zeros((D,))
+    std = jnp.ones((D,))
+    mean = mean.at[non_quat_mask].set(mean_sel)
+    std = std.at[non_quat_mask].set(std_sel)
     
+    return {'mean': mean, 'std': std}
+
+
+def compute_normalization_stats_cond(trajectories: jnp.ndarray) -> dict:
+    """Compute mean/std for conditioning vectors (no quaternion handling).
+
+    Args:
+        trajectories: (N, H+1, cond_dim) array of conditioning windows
+    Returns:
+        Dictionary with 'mean' and 'std' arrays of shape (cond_dim,)
+    """
+    mean = jnp.mean(trajectories, axis=(0, 1))
+    std = jnp.std(trajectories, axis=(0, 1), ddof=1)
+    std = jnp.clip(std, a_min=1e-6)
     return {'mean': mean, 'std': std}
 
 
@@ -63,26 +91,23 @@ def normalize_states(x: jnp.ndarray, stats: dict) -> jnp.ndarray:
     Returns:
         Normalized states
     """
-    # Apply z-score normalization
-    x_norm = (x - stats['mean']) / stats['std']
-    
-    # Re-normalize quaternion component (indices 3:7)
+    # Apply z-score normalization only to non-quaternion dims. Quaternion dims
+    # will be left unchanged (stats should have mean=0,std=1 for those dims).
+    D = x.shape[-1]
+    idx = jnp.arange(D)
+    non_quat_mask = jnp.logical_or(idx < 3, idx >= 7)
+
+    x_norm = x
+    sel = x[..., non_quat_mask]
+    mean_sel = stats['mean'][non_quat_mask]
+    std_sel = stats['std'][non_quat_mask]
+    sel_norm = (sel - mean_sel) / std_sel
+    x_norm = x_norm.at[..., non_quat_mask].set(sel_norm)
+
+    # Enforce quaternion unit-norm for numeric stability
     x_norm = normalize_quat(x_norm)
-    
+
     return x_norm
-
-
-def denormalize_states(x_norm: jnp.ndarray, stats: dict) -> jnp.ndarray:
-    """Reverse z-score normalization (for logging/visualization).
-    
-    Args:
-        x_norm: Normalized states (..., state_dim)
-        stats: Dictionary with 'mean' and 'std'
-    Returns:
-        Original scale states
-    """
-    return x_norm * stats['std'] + stats['mean']
-
 
 def create_train_state(
     rng: jax.Array,
@@ -102,6 +127,10 @@ def create_train_state(
         d_model=384,
         n_heads=6,
         depth=3, 
+        # NOTE: create_action_predictor expects the SEQUENCE LENGTH (H+1),
+        # while this function receives the trajectory horizon H.
+        # We add +1 here to include the initial state token.
+        horizon=horizon + 1,
         cond_dim=cond_dim,
         rng=rng,
     )
@@ -109,7 +138,7 @@ def create_train_state(
     # Create optimizer with global norm clipping (matching ODE.py - constant LR, no schedule)
     optimizer = optax.chain(
         optax.clip_by_global_norm(10.0),  # Match ODE.py gradient clipping
-        optax.adamw(learning_rate=learning_rate, weight_decay=1e-4),  # Match ODE.py: constant lr=2e-4
+        optax.adamw(learning_rate=learning_rate, weight_decay=1e-4),  
     )
     opt_state = optimizer.init(params)
     
@@ -121,52 +150,48 @@ def create_train_state(
     return model, params, optimizer, opt_state, ema_params
 
 
-@partial(jax.jit, static_argnames=('model_fn', 'rollout_op', 'ema_decay', 'optimizer', 'use_dim_weights'))
+@partial(jax.jit, static_argnames=('model_fn', 'rollout_op', 'ema_decay', 'optimizer'))
 def train_step(
     model_fn: Any,
     rollout_op: MuJoCoGo2Rollout,
     params: Any,
     opt_state: optax.OptState,
     optimizer: optax.GradientTransformation,
-    x1_demo: jnp.ndarray,
-    cond: Optional[jnp.ndarray],
+    x1_demo: jnp.ndarray, #already normalized
+    cond: Optional[jnp.ndarray], #already normalized
     rng: jax.Array,
     norm_stats: dict,
-    dim_weights: Optional[jnp.ndarray] = None,
-    use_dim_weights: bool = False,
     ema_params: Optional[Any] = None,
     ema_decay: Optional[float] = None,
 ) -> Tuple[Any, optax.OptState, float, float, jax.Array, Optional[Any], jnp.ndarray]:
-    """Single training step with optional EMA update and per-dim MSE logging."""
+    """Single training step with optional EMA update and per-dim MSE logging.
+    
+    Note: x1_demo and cond are expected to be ALREADY NORMALIZED.
+    """
     
     def loss_fn(params_in):
-        # Normalize x1_demo
-        x1_norm = normalize_states(x1_demo, norm_stats)
+        # x1_demo is already normalized
+        x1_norm = x1_demo
         
         # Sample x0 ~ N(0, I) for flow matching base distribution
-        noise_key, t_key, dropout_key, cond_mask_key = random.split(rng, 4)
+        noise_key, t_key = random.split(rng, 2)
         
-        # x0 is pure Gaussian noise (standard flow matching)
+        # x0 is pure Gaussian noise
         x0 = random.normal(noise_key, x1_norm.shape)
         # Preserve first state exactly (conditioned on initial observation)
         x0 = x0.at[:, 0, :].set(x1_norm[:, 0, :])
-        x0 = normalize_quat(x0)  # Re-normalize quaternions
-        
-        # # Apply 20% attribute dropout during training (matching ODE.py)
-        # if cond is not None:
-        #     # mask = (torch.rand(*condition.shape) > 0.2).int() from ODE.py
-        #     cond_mask = (random.uniform(cond_mask_key, cond.shape) > 0.2).astype(jnp.float32)
-        #     cond_masked = cond * cond_mask
-        # else:
-        #     cond_masked = None
+        x0 = normalize_quat(x0)  # ensure quaternion is unit quarternion
         
         # Sample t ~ U(0,1)
         t = random.uniform(t_key, (x1_demo.shape[0], 1), minval=0.0, maxval=1.0)
         
-        # Compute loss with dropout RNG and optional dimension weights
+        # cond is already normalized (if present)
+        cond_norm = cond
+        
+        # Compute loss
         loss, aux_dict = conditional_matching_loss(
             model_fn, params_in, rollout_op, x0, x1_norm, t, 
-            cond=cond, dim_weights=dim_weights, rng=dropout_key
+            cond=cond_norm, norm_stats=norm_stats
         )
         
         return loss, aux_dict
@@ -174,10 +199,8 @@ def train_step(
     # Compute gradients
     (loss, aux_dict), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
     
-    # Extract x1_hat from aux dict and compute per-dimension MSE for diagnostics
-    x1_norm = normalize_states(x1_demo, norm_stats)
-    x1_hat = aux_dict['x1_hat']
-    per_dim_mse = jnp.mean((x1_hat - x1_norm) ** 2, axis=(0, 1))  # Shape: (state_dim,)
+    # Extract per-dimension MSE aligned with training weights for diagnostics
+    per_dim_mse = aux_dict['per_dim_weighted_mse']  # Shape: (state_dim,)
     
     # Compute gradient norm for monitoring
     grad_norm = jnp.sqrt(sum(jnp.sum(g**2) for g in jax.tree.leaves(grads))) #this is the pre-clipped grad norm
@@ -213,15 +236,15 @@ def main():
         default="Unitree_go2/go2_mjx_gym.xml",
         help="Path to MuJoCo XML model",
     )
-    parser.add_argument("--horizon", type=int, default=10, help="Trajectory horizon")
+    parser.add_argument("--horizon", type=int, default=16, help="Trajectory horizon")
     parser.add_argument("--batch", type=int, default=128, help="Batch size")
     parser.add_argument("--epochs", type=int, default=200, help="Training epochs")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate (ODE.py uses 2e-4)")
     parser.add_argument(
         "--stride",
         type=int,
-        default=11, #ensures no overlap for horizon=10
-        help="Stride for sliding window extraction (default: 10, reduces memory)",
+        default=17, #ensures no overlap for horizon=16
+        help="Stride for sliding window extraction (default: 17, reduces memory)",
     )
     parser.add_argument(
         "--save",
@@ -232,8 +255,8 @@ def main():
     parser.add_argument(
         "--save-interval",
         type=int,
-        default=50,
-        help="Save checkpoint every N epochs (default: 50)",
+        default=25,
+        help="Save checkpoint every N epochs (default: 25)",
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument(
@@ -260,17 +283,7 @@ def main():
         default=None,
         help="Maximum number of episodes to load (for memory management)",
     )
-    parser.add_argument(
-        "--use-dim-weights",
-        action="store_true",
-        help="Enable inverse variance weighting per dimension (adaptive based on per_dim_mse)",
-    )
-    parser.add_argument(
-        "--dim-weight-warmup",
-        type=int,
-        default=100,
-        help="Number of steps before computing dimension weights (default: 100)",
-    )
+
     
     # Weights & Biases
     parser.add_argument(
@@ -336,22 +349,37 @@ def main():
     all_data = dataset.get_batch(all_indices)
     all_trajectories = jnp.array(all_data['trajectories'])  # Transfer once to GPU
     all_conds = jnp.array(all_data['cond']) if 'cond' in all_data else None
+
+    print(f'trajectories has shape {all_trajectories.shape}, conditioning has shape {all_conds.shape}')
     print(f"✓ Dataset on GPU: {all_trajectories.devices()}")
     print(f"  Memory: {all_trajectories.nbytes / 1e9:.2f} GB")
     
-    # Compute normalization statistics (matching ODE.py)
+    # Compute normalization statistics from raw data
     print("\nComputing normalization statistics...")
     norm_stats = compute_normalization_stats(all_trajectories)
     
-    # Compute sigma_data: global std of normalized data (matching ODE.py)
-    normalized_trajs = normalize_states(all_trajectories, norm_stats)
-    sigma_data = float(jnp.std(normalized_trajs))
-    norm_stats['sigma_data'] = sigma_data
+    # print(f"✓ Normalization stats computed")
+    # print(f"  Mean: min={float(norm_stats['mean'].min()):.3f}, max={float(norm_stats['mean'].max()):.3f}")
+    # print(f"  Std:  min={float(norm_stats['std'].min()):.3f}, max={float(norm_stats['std'].max()):.3f}")
+
+    # Conditioning normalization (if available)
+    norm_stats_cond = None
+    if all_conds is not None:
+        # Conditioning is (N, H+1, cond_dim) - compute mean/std across batch and time
+        norm_stats_cond = compute_normalization_stats_cond(all_conds)
+
+    # Normalize dataset once
+    print("\nNormalizing dataset...")
+    all_trajectories = normalize_states(all_trajectories, norm_stats)
+    if all_conds is not None:
+        all_conds = (all_conds - norm_stats_cond['mean']) / norm_stats_cond['std']
     
-    print(f"✓ Normalization stats computed")
-    print(f"  Mean: min={float(norm_stats['mean'].min()):.3f}, max={float(norm_stats['mean'].max()):.3f}")
-    print(f"  Std:  min={float(norm_stats['std'].min()):.3f}, max={float(norm_stats['std'].max()):.3f}")
-    print(f"  sigma_data (global): {sigma_data:.3f}")
+    # Compute sigma_data from normalized data
+    sigma_data = float(jnp.std(all_trajectories))
+    norm_stats['sigma_data'] = sigma_data
+    print(f"✓ Dataset normalized on GPU")
+    print(f"  sigma_data (global std of normalized data): {sigma_data:.3f}")
+    
     
     # Setup rollout operator
     print("\nInitializing rollout operator...")
@@ -398,8 +426,6 @@ def main():
                     "action_dim": action_dim,
                     "cond_dim": cond_dim,
                     "n_samples": n_samples,
-                    "use_dim_weights": args.use_dim_weights,
-                    "dim_weight_warmup": args.dim_weight_warmup,
                 },
             )
             print("✓ W&B initialized")
@@ -413,14 +439,6 @@ def main():
     
     global_step = 0
     steps_per_epoch = n_samples // args.batch
-    
-    # Initialize dimension weights tracking
-    dim_weights = None
-    cumulative_per_dim_mse = None
-    mse_count = 0
-    
-    if args.use_dim_weights:
-        print(f"Inverse variance weighting enabled (warmup: {args.dim_weight_warmup} steps)")
     
     epoch_bar = tqdm(range(args.epochs), desc="Epochs")
     
@@ -442,11 +460,11 @@ def main():
             batch_end = batch_start + args.batch
             batch_indices = indices[batch_start:batch_end]
             
-            # Index directly from GPU arrays (no CPU transfer!)
+            # Note: data is already normalized
             x1_demo = all_trajectories[batch_indices]
             cond = all_conds[batch_indices] if all_conds is not None else None
             
-            # Training step (note: normalization happens inside train_step now)
+            # Training step
             rng, step_rng = random.split(rng)
             params, opt_state, loss, grad_norm, _, ema_params, per_dim_mse = train_step(
                 model_fn=model.apply,
@@ -458,40 +476,9 @@ def main():
                 cond=cond,
                 rng=step_rng,
                 norm_stats=norm_stats,
-                dim_weights=dim_weights,
-                use_dim_weights=args.use_dim_weights,
                 ema_params=ema_params,
                 ema_decay=ema_decay,
             )
-            
-            # Accumulate per-dimension MSE for computing weights
-            if args.use_dim_weights:
-                if cumulative_per_dim_mse is None:
-                    cumulative_per_dim_mse = per_dim_mse
-                else:
-                    cumulative_per_dim_mse = cumulative_per_dim_mse + per_dim_mse
-                mse_count += 1
-                
-                # Compute dimension weights after warmup period
-                if global_step == args.dim_weight_warmup and mse_count > 0:
-                    avg_per_dim_mse = cumulative_per_dim_mse / mse_count
-                    # Inverse variance weighting: dimensions with higher MSE get lower weight
-                    dim_weights = 1.0 / (avg_per_dim_mse + 1e-6)
-                    # Normalize so mean weight is 1.0
-                    dim_weights = dim_weights / dim_weights.mean()
-                    print(f"\n✓ Dimension weights computed at step {global_step}")
-                    print(f"  Weight range: [{float(dim_weights.min()):.3f}, {float(dim_weights.max()):.3f}]")
-                    
-                    # Log to W&B
-                    if wandb_run:
-                        try:
-                            dim_weight_dict = {
-                                f"dim_weights/dim_{i}": float(dim_weights[i])
-                                for i in range(min(state_dim, 10))
-                            }
-                            wandb.log(dim_weight_dict, step=global_step)
-                        except Exception:
-                            pass
             
             # Convert JAX arrays to Python floats for logging
             loss = float(loss)
@@ -562,7 +549,8 @@ def main():
                 'epoch': epoch + 1,
                 'norm_mean': np.array(norm_stats['mean']),
                 'norm_std': np.array(norm_stats['std']),
-                'sigma_data': norm_stats['sigma_data'],
+                'cond_norm_mean': np.array(norm_stats_cond['mean']) if norm_stats_cond is not None else None,
+                'cond_norm_std': np.array(norm_stats_cond['std']) if norm_stats_cond is not None else None,
             }
             
             if ema_params is not None:
@@ -595,7 +583,8 @@ def main():
         'cond_dim': cond_dim if cond_dim is not None else -1,
         'norm_mean': np.array(norm_stats['mean']),
         'norm_std': np.array(norm_stats['std']),
-        'sigma_data': norm_stats['sigma_data'],
+        'cond_norm_mean': np.array(norm_stats_cond['mean']) if norm_stats_cond is not None else None,
+        'cond_norm_std': np.array(norm_stats_cond['std']) if norm_stats_cond is not None else None,
     }
     
     # Also save regular params and EMA separately if EMA was used
@@ -628,8 +617,6 @@ if __name__ == "__main__":
 Usage Examples:
 python train_flow_matching.py \
     --data logs/ppo_policy2/trajectories/trajectories.npz \
-    --use-dim-weights \
-    --dim-weight-warmup 100 \
     --wandb online \
     --wandb-project dynaflow-go2
 
@@ -639,5 +626,5 @@ Memory Management Tips:
 - Use --max-episodes to limit dataset size
 - Reduce --batch to 32 or 64 if OOM
 - Reduce --horizon to 8-10 for less memory per sample
-- The script now limits JAX to 70% GPU memory by default
+- The script now limits JAX to 80% GPU memory by default
 """
