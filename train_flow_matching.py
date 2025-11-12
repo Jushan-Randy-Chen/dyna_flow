@@ -10,6 +10,7 @@ import argparse
 import os
 import time
 from functools import partial
+from pathlib import Path
 from typing import Optional, Tuple, Any
 
 # Configure JAX memory allocation BEFORE importing jax
@@ -22,9 +23,10 @@ from jax import random
 import numpy as np
 import optax
 from tqdm.auto import tqdm
+import orbax.checkpoint as ocp
 
 # DynaFlow modules
-from model import create_action_predictor, count_parameters
+from model import create_action_predictor, count_parameters, params_to_bytes
 from rollout import MuJoCoGo2Rollout
 from losses import conditional_matching_loss
 from data import load_trajectory_dataset
@@ -49,6 +51,7 @@ def compute_normalization_stats(trajectories: jnp.ndarray) -> dict:
     # We compute mean/std over batch and time for non-quaternion dims and
     # set quaternion dims' mean=0, std=1 so they are left unchanged by z-score.
     # This preserves the unit-norm manifold structure of quaternions.
+    trajectories = jnp.nan_to_num(trajectories, nan=0.0, posinf=0.0, neginf=0.0)
     D = trajectories.shape[-1]
     idx = jnp.arange(D)
     non_quat_mask = jnp.logical_or(idx < 3, idx >= 7)  # True for dims to normalize
@@ -56,9 +59,11 @@ def compute_normalization_stats(trajectories: jnp.ndarray) -> dict:
     # Select non-quaternion channels and compute stats there
     sel = trajectories[..., non_quat_mask]
     mean_sel = jnp.mean(sel, axis=(0, 1))
-    std_sel = jnp.std(sel, axis=(0, 1), ddof=1)
+    std_sel = jnp.std(sel, axis=(0, 1), ddof=0)
+    mean_sel = jnp.nan_to_num(mean_sel, nan=0.0)
+    std_sel = jnp.nan_to_num(std_sel, nan=1.0, posinf=1.0, neginf=1.0)
     std_sel = jnp.clip(std_sel, a_min=1e-6)
-
+    
     # Build full mean/std arrays where quaternion dims have mean=0 and std=1
     mean = jnp.zeros((D,))
     std = jnp.ones((D,))
@@ -76,8 +81,11 @@ def compute_normalization_stats_cond(trajectories: jnp.ndarray) -> dict:
     Returns:
         Dictionary with 'mean' and 'std' arrays of shape (cond_dim,)
     """
+    trajectories = jnp.nan_to_num(trajectories, nan=0.0, posinf=0.0, neginf=0.0)
     mean = jnp.mean(trajectories, axis=(0, 1))
-    std = jnp.std(trajectories, axis=(0, 1), ddof=1)
+    std = jnp.std(trajectories, axis=(0, 1), ddof=0)
+    mean = jnp.nan_to_num(mean, nan=0.0)
+    std = jnp.nan_to_num(std, nan=1.0, posinf=1.0, neginf=1.0)
     std = jnp.clip(std, a_min=1e-6)
     return {'mean': mean, 'std': std}
 
@@ -100,14 +108,13 @@ def normalize_states(x: jnp.ndarray, stats: dict) -> jnp.ndarray:
     x_norm = x
     sel = x[..., non_quat_mask]
     mean_sel = stats['mean'][non_quat_mask]
-    std_sel = stats['std'][non_quat_mask]
+    std_sel = jnp.clip(stats['std'][non_quat_mask], a_min=1e-6)
     sel_norm = (sel - mean_sel) / std_sel
     x_norm = x_norm.at[..., non_quat_mask].set(sel_norm)
-
+    
     # Enforce quaternion unit-norm for numeric stability
     x_norm = normalize_quat(x_norm)
-
-    return x_norm
+    return jnp.nan_to_num(x_norm, nan=0.0, posinf=0.0, neginf=0.0)
 
 def create_train_state(
     rng: jax.Array,
@@ -162,7 +169,7 @@ def train_step(
     rng: jax.Array,
     norm_stats: dict,
     ema_params: Optional[Any] = None,
-    ema_decay: Optional[float] = None,
+    ema_decay: Optional[float] = None
 ) -> Tuple[Any, optax.OptState, float, float, jax.Array, Optional[Any], jnp.ndarray]:
     """Single training step with optional EMA update and per-dim MSE logging.
     
@@ -181,10 +188,8 @@ def train_step(
         # Preserve first state exactly (conditioned on initial observation)
         x0 = x0.at[:, 0, :].set(x1_norm[:, 0, :])
         x0 = normalize_quat(x0)  # ensure quaternion is unit quarternion
-        
-        # Sample t ~ U(0,1)
+
         t = random.uniform(t_key, (x1_demo.shape[0], 1), minval=0.0, maxval=1.0)
-        
         # cond is already normalized (if present)
         cond_norm = cond
         
@@ -200,7 +205,8 @@ def train_step(
     (loss, aux_dict), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
     
     # Extract per-dimension MSE aligned with training weights for diagnostics
-    per_dim_mse = aux_dict['per_dim_weighted_mse']  # Shape: (state_dim,)
+    # per_dim_mse = aux_dict['per_dim_weighted_mse']  # Shape: (state_dim,)
+    per_dim_mse = None
     
     # Compute gradient norm for monitoring
     grad_norm = jnp.sqrt(sum(jnp.sum(g**2) for g in jax.tree.leaves(grads))) #this is the pre-clipped grad norm
@@ -251,6 +257,18 @@ def main():
         type=str,
         default="logs/dynaflow_jax.npz",
         help="Model save path",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="logs/checkpoints",
+        help="Directory where Orbax checkpoints are stored",
+    )
+    parser.add_argument(
+        "--max-checkpoints",
+        type=int,
+        default=5,
+        help="Maximum number of Orbax checkpoints to keep",
     )
     parser.add_argument(
         "--save-interval",
@@ -318,6 +336,16 @@ def main():
     print(f"EMA decay: {args.ema_decay if args.ema_decay > 0 else 'disabled'}")
     print("=" * 80)
     
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_manager = ocp.CheckpointManager(
+        str(checkpoint_dir),
+        options=ocp.CheckpointManagerOptions(
+            max_to_keep=args.max_checkpoints,
+            create=True,
+        ),
+    )
+    
     # Initialize RNG
     rng = random.PRNGKey(args.seed)
     
@@ -332,8 +360,8 @@ def main():
         max_windows=max_windows,
     )
     
-    state_dim = dataset.state_dim
-    cond_dim = dataset.cond_dim
+    state_dim = dataset.state_dim #37
+    cond_dim = dataset.cond_dim #36
     n_samples = len(dataset)
     
     print(f"✓ Loaded {n_samples} trajectory windows")
@@ -371,8 +399,11 @@ def main():
     # Normalize dataset once
     print("\nNormalizing dataset...")
     all_trajectories = normalize_states(all_trajectories, norm_stats)
+    all_trajectories = jnp.nan_to_num(all_trajectories, nan=0.0, posinf=0.0, neginf=0.0)
     if all_conds is not None:
-        all_conds = (all_conds - norm_stats_cond['mean']) / norm_stats_cond['std']
+        cond_std = jnp.clip(norm_stats_cond['std'], a_min=1e-6)
+        all_conds = (all_conds - norm_stats_cond['mean']) / cond_std
+        all_conds = jnp.nan_to_num(all_conds, nan=0.0, posinf=0.0, neginf=0.0)
     
     # Compute sigma_data from normalized data
     sigma_data = float(jnp.std(all_trajectories))
@@ -466,7 +497,14 @@ def main():
             
             # Training step
             rng, step_rng = random.split(rng)
-            params, opt_state, loss, grad_norm, _, ema_params, per_dim_mse = train_step(
+            # # Simple t-curriculum: linearly decay t_floor from 0.9 to 0.0 over first 20% epochs
+            # progress = (epoch + 1) / max(1, args.epochs)
+            # if progress < 0.2:
+            #     t_floor = 0.9 * (1.0 - progress / 0.2)
+            # else:
+            #     t_floor = 0.0
+
+            params, opt_state, loss, grad_norm, _, ema_params, _ = train_step(
                 model_fn=model.apply,
                 rollout_op=rollout,
                 params=params,
@@ -504,12 +542,12 @@ def main():
                     )
                     
                     # Log per-dimension MSE periodically (every 100 steps)
-                    if global_step % 100 == 0:
-                        per_dim_dict = {
-                            f"train/mse_dim_{i}": float(per_dim_mse[i])
-                            for i in range(min(state_dim, 10))  # Log first 10 dims to avoid clutter
-                        }
-                        wandb.log(per_dim_dict, step=global_step)
+                    # if global_step % 100 == 0:
+                    #     per_dim_dict = {
+                    #         f"train/mse_dim_{i}": float(per_dim_mse[i])
+                    #         for i in range(min(state_dim, 10))  # Log first 10 dims to avoid clutter
+                    #     }
+                    #     wandb.log(per_dim_dict, step=global_step)
                 except Exception:
                     pass
             
@@ -531,34 +569,40 @@ def main():
         
         # Save checkpoint periodically
         if (epoch + 1) % args.save_interval == 0:
-            checkpoint_path = args.save.replace('.npz', f'_epoch{epoch+1}.npz')
-            os.makedirs(os.path.dirname(checkpoint_path) or '.', exist_ok=True)
-            
-            from flax import serialization
-            
-            # Save EMA parameters if available
             ckpt_params = ema_params if ema_params is not None else params
-            model_bytes = serialization.to_bytes(ckpt_params)
-            
-            save_dict = {
-                'model': model_bytes,
-                'state_dim': state_dim,
-                'action_dim': action_dim,
-                'horizon': args.horizon,
-                'cond_dim': cond_dim if cond_dim is not None else -1,
-                'epoch': epoch + 1,
-                'norm_mean': np.array(norm_stats['mean']),
-                'norm_std': np.array(norm_stats['std']),
-                'cond_norm_mean': np.array(norm_stats_cond['mean']) if norm_stats_cond is not None else None,
-                'cond_norm_std': np.array(norm_stats_cond['std']) if norm_stats_cond is not None else None,
+            state_payload = {
+                "params": ckpt_params,
+                "opt_state": opt_state,
+                "norm_mean": norm_stats["mean"],
+                "norm_std": norm_stats["std"],
             }
-            
             if ema_params is not None:
-                save_dict['model_regular'] = serialization.to_bytes(params)
-                save_dict['ema_decay'] = ema_decay
-            
-            np.savez(checkpoint_path, **save_dict)
-            print(f"  ✓ Checkpoint saved: {checkpoint_path}")
+                state_payload["ema_params"] = ema_params
+            if norm_stats_cond is not None:
+                state_payload["cond_norm_mean"] = norm_stats_cond["mean"]
+                state_payload["cond_norm_std"] = norm_stats_cond["std"]
+            metadata_payload = {
+                "epoch": int(epoch + 1),
+                "global_step": int(global_step),
+                "state_dim": int(state_dim),
+                "action_dim": int(action_dim),
+                "horizon": int(args.horizon),
+                "cond_dim": int(cond_dim) if cond_dim is not None else -1,
+            }
+            if ema_params is not None and ema_decay is not None:
+                metadata_payload["ema_decay"] = float(ema_decay)
+            if "sigma_data" in norm_stats:
+                metadata_payload["sigma_data"] = float(norm_stats["sigma_data"])
+            ckpt_args = ocp.args.Composite(
+                state=ocp.args.StandardSave(state_payload),
+                metadata=ocp.args.JsonSave(metadata_payload),
+            )
+            checkpoint_manager.save(epoch + 1, args=ckpt_args)
+            checkpoint_manager.wait_until_finished()
+            print(f"  ✓ Orbax checkpoint saved to {checkpoint_dir}")
+    
+    checkpoint_manager.wait_until_finished()
+    checkpoint_manager.close()
     
     # Save model
     print("\n" + "=" * 80)
@@ -567,12 +611,9 @@ def main():
     
     os.makedirs(os.path.dirname(args.save), exist_ok=True)
     
-    # Save using Flax serialization
-    from flax import serialization
-    
     # Use EMA parameters if available, otherwise use regular params
     final_params = ema_params if ema_params is not None else params
-    model_bytes = serialization.to_bytes(final_params)
+    model_bytes = params_to_bytes(final_params)
     
     # Save with metadata
     save_dict = {
@@ -589,7 +630,7 @@ def main():
     
     # Also save regular params and EMA separately if EMA was used
     if ema_params is not None:
-        save_dict['model_regular'] = serialization.to_bytes(params)
+        save_dict['model_regular'] = params_to_bytes(params)
         save_dict['ema_decay'] = ema_decay
         print(f"  Saving EMA parameters (decay={ema_decay})")
     

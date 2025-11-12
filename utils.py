@@ -9,7 +9,6 @@ import numpy as np
 import os
 from typing import Any, Dict, Optional, Tuple
 from flax.training import checkpoints
-from flax import serialization
 import optax
 
 

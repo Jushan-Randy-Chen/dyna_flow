@@ -13,10 +13,9 @@ import jax
 import jax.numpy as jnp
 from jax import random
 import numpy as np
-from flax import serialization
 import mediapy as media
 
-from model import create_action_predictor
+from model import create_action_predictor, bytes_to_params
 from rollout import MuJoCoGo2Rollout
 from losses import interpolate_xt, velocity_field
 
@@ -181,7 +180,7 @@ def main():
     )
     
     # Load trained parameters
-    params = serialization.from_bytes(init_params, data['model'])
+    params = bytes_to_params(data['model'], init_params)
     print("✓ Model loaded")
     
     # Setup rollout

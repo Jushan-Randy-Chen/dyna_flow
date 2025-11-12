@@ -7,7 +7,9 @@ from the DynaFlow paper (Eqs. 4-5).
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from typing import Optional, Tuple, Callable
+
 
 
 def interpolate_xt(
@@ -73,20 +75,19 @@ def denormalize_states(x_norm: jnp.ndarray, stats: dict) -> jnp.ndarray:
     # assumed to be left unchanged by normalization (stats mean=0,std=1) and
     # we still enforce unit norm for numerical safety.
     D = x_norm.shape[-1]
-    idx = jnp.arange(D)
-    non_quat_mask = jnp.logical_or(idx < 3, idx >= 7)
+    idx = np.arange(D)
+    non_quat_mask = np.logical_or(idx < 3, idx >= 7)
 
     # Denormalize selected channels
     x_denorm = x_norm
     sel = x_norm[..., non_quat_mask]
     mean_sel = stats['mean'][non_quat_mask]
-    std_sel = stats['std'][non_quat_mask]
+    std_sel = jnp.clip(stats['std'][non_quat_mask], a_min=1e-6)
     sel_denorm = sel * std_sel + mean_sel
     x_denorm = x_denorm.at[..., non_quat_mask].set(sel_denorm)
 
     # Ensure quaternion component is unit length
     x_denorm = normalize_quat(x_denorm)
-
     return x_denorm
 
 
@@ -102,19 +103,18 @@ def normalize_states(x: jnp.ndarray, stats: dict) -> jnp.ndarray:
     # Apply z-score normalization only to non-quaternion dims. Quaternion dims
     # will be left unchanged (stats should have mean=0,std=1 for those dims).
     D = x.shape[-1]
-    idx = jnp.arange(D)
-    non_quat_mask = jnp.logical_or(idx < 3, idx >= 7)
+    idx = np.arange(D)
+    non_quat_mask = np.logical_or(idx < 3, idx >= 7)
 
     x_norm = x
     sel = x[..., non_quat_mask]
     mean_sel = stats['mean'][non_quat_mask]
-    std_sel = stats['std'][non_quat_mask]
+    std_sel = jnp.clip(stats['std'][non_quat_mask], a_min=1e-6)
     sel_norm = (sel - mean_sel) / std_sel
     x_norm = x_norm.at[..., non_quat_mask].set(sel_norm)
 
     # Enforce quaternion unit-norm for numeric stability
     x_norm = normalize_quat(x_norm)
-
     return x_norm
 
 
@@ -183,6 +183,7 @@ def conditional_matching_loss(
         cond=cond,
         deterministic=True
     )  # (batch, H, action_dim)
+    U_hat = U_hat
     
     # Rollout to get predicted terminal trajectory
     # NOTE: Rollout operates in RAW (unnormalized) space
@@ -193,12 +194,15 @@ def conditional_matching_loss(
         x0_initial_raw = denormalize_states(x0_initial, norm_stats)
         # Run rollout in raw physical space
         X1_hat_raw = rollout_fn(x0_initial_raw, U_hat)  # (batch, H+1, state_dim)
+        X1_hat_raw = X1_hat_raw
         # Re-normalize for loss computation
         X1_hat = normalize_states(X1_hat_raw, norm_stats)
+        X1_hat = X1_hat
         X1_hat = normalize_quat(X1_hat)  # Re-normalize quaternions
     else:
         # No normalization stats provided - assume already in correct space
         X1_hat = rollout_fn(x0_initial, U_hat)  # (batch, H+1, state_dim)
+   
     
     # Default weight mask:
     # - First state (t=0): weight 0.0 (preserved, no loss)
@@ -207,20 +211,17 @@ def conditional_matching_loss(
         weight_mask = jnp.ones_like(X1_hat)
         weight_mask = weight_mask.at[:, 0, :].set(0.0)  # No loss on first state
 
-    # if dim_weights is None:
-    #     dim_weights_arr = jnp.ones((X1_hat.shape[-1],), dtype=X1_hat.dtype)
-    # else:
-    #     dim_weights_arr = jnp.asarray(dim_weights, dtype=X1_hat.dtype)
 
     # Special handling for quaternion components (indices 3:7):
     # Quaternions have sign ambiguity (q and -q represent same rotation).
     # To compute a consistent Euclidean-style difference (chordal distance)
     # we align signs by flipping predicted quaternions where the dot with
     # the demo quaternion is negative, then subtract component-wise.
-    q_hat = X1_hat[..., 3:7]
-    q_demo = x1_demo[..., 3:7]
 
-    # Ensure unit length (numerical safety)
+    q_hat = X1_hat[..., 3:7]  # quaternion component!
+    q_demo = x1_demo[..., 3:7]  # quaternion component from expert traj!
+
+    # Ensure unit length (numerical safety) -- should already be normalized
     q_hat = q_hat / jnp.linalg.norm(q_hat, axis=-1, keepdims=True).clip(min=1e-6)
     q_demo = q_demo / jnp.linalg.norm(q_demo, axis=-1, keepdims=True).clip(min=1e-6)
 
@@ -236,60 +237,61 @@ def conditional_matching_loss(
     # Align q_hat sign to q_demo to remove q ~ -q ambiguity (dot may be negative).
     q_hat = X1_hat_aligned[..., 3:7]
     q_demo = x1_demo[..., 3:7]
+
     # Ensure unit length (numerical safety)
     q_hat = q_hat / jnp.linalg.norm(q_hat, axis=-1, keepdims=True).clip(min=1e-6)
     q_demo = q_demo / jnp.linalg.norm(q_demo, axis=-1, keepdims=True).clip(min=1e-6)
-    dot = jnp.sum(q_hat * q_demo, axis=-1, keepdims=True)
+    dot = jnp.sum(q_hat * q_demo, axis=-1, keepdims=True)  # (batch, H+1, 1)
     dot_clipped = jnp.clip(dot, -1.0, 1.0)
-    angle = 2.0 * jnp.arccos(dot_clipped)  # angle in radians
-    angle_sq = angle ** 2  # scalar squared angle per sample/times
+
+    # Avoid NaNs from arccos'(x) at |x| = 1 by contracting the range slightly.
+    dot_safe = jnp.clip(dot_clipped, a_min=-1.0 + 1e-4, a_max=1.0 - 1e-4)
+    angle = 2.0 * jnp.arccos(dot_safe)  # (batch, H+1, 1)
+    angle_sq = angle ** 2  # (batch, H+1, 1)
 
     # Prepare component-wise diff but zero quaternion components (we'll add angular term separately)
     diff = X1_hat_aligned - x1_demo
     diff_nonquat = diff.at[..., 3:7].set(0.0)
-
-    weighted_mask = weight_mask
-    weighted_diff_sq_nonquat = weighted_mask * (diff_nonquat ** 2) #non-quarternion component of error
-
-    # Quaternion weight per sample/time: average weight across 4 quaternion components
-    w_q = weight_mask[..., 3:7].mean(axis=-1)  # shape (batch, H+1)
-
-    total_weight_nonquat = weighted_diff_sq_nonquat.sum()
-    total_weight_quat = w_q.sum()
-
-    quat_contrib = (w_q * angle_sq[..., 0]).sum()
-
-    total_weight = total_weight_nonquat + total_weight_quat
-    loss = (weighted_diff_sq_nonquat.sum() + quat_contrib) / jnp.maximum(total_weight, 1e-6)
-
-    per_dim_weight = weighted_mask.sum(axis=(0, 1))
-    per_dim_weighted_mse_nonquat = jnp.where(
-        per_dim_weight > 0.0,
-        weighted_diff_sq_nonquat.sum(axis=(0, 1)) / per_dim_weight,
-        0.0,
-    )
     
-    # Quaternion weighted mse: broadcast scalar across quaternion components for diagnostics
-    quat_weighted_mse_scalar = jnp.where(total_weight_quat > 0.0, quat_contrib / total_weight_quat, 0.0)
-    per_dim_weighted_mse = per_dim_weighted_mse_nonquat.at[3:7].set(quat_weighted_mse_scalar)
 
-    unweighted_mask = weight_mask.sum(axis=(0, 1))
-    per_dim_unweighted_mse_nonquat = jnp.where(
-        unweighted_mask > 0.0,
-        (weight_mask * (diff_nonquat ** 2)).sum(axis=(0, 1)) / unweighted_mask,
-        0.0,
-    )
-    quat_unweighted_mse_scalar = angle_sq.mean()
-    per_dim_unweighted_mse = per_dim_unweighted_mse_nonquat.at[3:7].set(quat_unweighted_mse_scalar)
+    weighted_diff_sq_nonquat = weight_mask * (diff_nonquat ** 2)  # non-quaternion component of error
+    weight_mask_nonquat = weight_mask.at[..., 3:7].set(0.0)
+    total_weight_nonquat = weight_mask_nonquat.sum()
 
+    # Quaternion weights: mean mask value across the 4 quaternion channels -- optional, since the weights are usually 1.0
+    w_q = weight_mask[..., 3:7].mean(axis=-1)  # (batch, H+1)
+    w_q = w_q.at[:, 0].set(0.0)  # ignore first time step in the horizon
+    angle_sq = angle_sq[..., 0]  # squeeze last dim -> (batch, H+1)
+    quat_contrib = (w_q * angle_sq).sum()
+    total_weight_quat = jnp.maximum(w_q.sum(), 1e-6)
+
+    total_weight = jnp.maximum(total_weight_nonquat + total_weight_quat, 1e-6)
+    loss = (weighted_diff_sq_nonquat.sum() + quat_contrib) / total_weight
+
+    # per_dim_weight = weighted_mask.sum(axis=(0, 1))
+    # per_dim_weighted_mse_nonquat = jnp.where(
+    #     per_dim_weight > 0.0,
+    #     weighted_diff_sq_nonquat.sum(axis=(0, 1)) / per_dim_weight,
+    #     0.0,
+    # )
+    
+
+    # unweighted_mask = weight_mask.sum(axis=(0, 1))
+    # per_dim_unweighted_mse_nonquat = jnp.where(
+    #     unweighted_mask > 0.0,
+    #     (weight_mask * (diff_nonquat ** 2)).sum(axis=(0, 1)) / unweighted_mask,
+    #     0.0,
+    # )
+    # quat_unweighted_mse_scalar = angle_sq.mean()
+    # per_dim_unweighted_mse = per_dim_unweighted_mse_nonquat.at[3:7].set(quat_unweighted_mse_scalar)
+    
     # Auxiliary outputs for monitoring
     aux = {
         'x1_hat': X1_hat,
         'u_hat': U_hat,
         'mse': (diff ** 2).mean(),
         'weighted_mse': loss,
-        'per_dim_weighted_mse': per_dim_weighted_mse,
-        'per_dim_unweighted_mse': per_dim_unweighted_mse,
+        # 'per_dim_unweighted_mse': per_dim_unweighted_mse,
     }
     
     return loss, aux

@@ -217,7 +217,7 @@ class Go2Env(PipelineEnv):
         self._kick_vel = kick_vel
         self._init_q = jp.array(sys.mj_model.keyframe('home').qpos)
         self._default_pose = sys.mj_model.keyframe('home').qpos[7:]
-
+        
         # self._init_q = np.array([0, 0, 0.27, 1, 0, 0, 0, 0, 0.9, -1.8, 0, 0.9, -1.8, 0, 0.9, -1.8, 0, 0.9, -1.8])
         # self._default_pose = np.array([0.0, 0.9, -1.8] * 4)
         self.lowers = jp.array([-0.7, -1.0, -2.2] * 4)
@@ -390,7 +390,7 @@ class Go2Env(PipelineEnv):
         state.info['step'] = jp.where(
             done | (state.info['step'] > 500), 0, state.info['step']
         )
-
+        
         # log total displacement as a proxy metric
         state.metrics['total_dist'] = math.normalize(x.pos[self._torso_idx - 1])[1]
         state.metrics.update(state.info['rewards'])

@@ -1,57 +1,69 @@
 """
-JAX/Flax implementation of the 1D Diffusion Transformer (DiT) for action prediction.
+JAX/Flax NNX implementation of the 1D Diffusion Transformer (DiT) for action prediction.
 
-This module implements the action prediction network D_θ that takes a noisy state
-trajectory X_t, time t, and optional conditioning c, and outputs an action sequence U^.
-
-Based on the DiT architecture from the DynaFlow paper.
+This module builds the action prediction network D_θ that consumes a noisy state
+trajectory X_t, diffusion time t, and optional conditioning signal c, and returns
+the predicted action sequence Ũ. The architecture mirrors the DiT backbone from
+the DynaFlow paper but is written using the object-style Flax.nnx API that is also
+used throughout the `gpc` reference repository.
 """
+
+from __future__ import annotations
+
+import copy
+import math
+from dataclasses import dataclass
+from typing import Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
 from jax import random
-import flax.linen as nn
-from typing import Optional, Callable
-import math
+from flax import nnx, serialization
+from flax.nnx import statelib
 
 
 def modulate(x: jnp.ndarray, shift: jnp.ndarray, scale: jnp.ndarray) -> jnp.ndarray:
-    """Apply adaptive layer norm modulation: x * (1 + scale) + shift"""
+    """Apply adaptive layer norm modulation: x * (1 + scale) + shift."""
     return x * (1 + scale[:, None, :]) + shift[:, None, :]
 
 
 def mish(x: jnp.ndarray) -> jnp.ndarray:
-    """Mish activation: x * tanh(softplus(x)) = x * tanh(ln(1 + e^x))"""
-    return x * jnp.tanh(nn.softplus(x))
+    """Mish activation: x * tanh(softplus(x)) = x * tanh(ln(1 + e^x))."""
+    return x * jnp.tanh(nnx.softplus(x))
 
 
-class SinusoidalPosEmb(nn.Module):
+class SinusoidalPosEmb(nnx.Module):
     """Sinusoidal positional embeddings for sequence positions."""
-    
-    dim: int
-    
-    @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+
+    def __init__(self, dim: int):
+        self.dim = dim
+        self.half_dim = max(dim // 2, 1)
+
+    def __call__(self, positions: jnp.ndarray) -> jnp.ndarray:
         """
         Args:
-            x: Position indices (seq_len,)
+            positions: Position indices (seq_len,)
         Returns:
             Positional embeddings (seq_len, dim)
         """
-        half_dim = self.dim // 2
-        emb = math.log(10000.0) / (half_dim - 1)
-        emb = jnp.exp(jnp.arange(half_dim) * -emb)
-        emb = x[:, None] * emb[None, :]
-        emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
+        freq_factor = math.log(10000.0) / max(self.half_dim - 1, 1)
+        freqs = jnp.exp(jnp.arange(self.half_dim) * -freq_factor)
+        # Ensure float input for broadcasting.
+        angles = positions.astype(jnp.float32)[..., None] * freqs[None, :]
+        emb = jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=-1)
+        if emb.shape[-1] < self.dim:
+            pad_width = self.dim - emb.shape[-1]
+            emb = jnp.pad(emb, ((0, 0), (0, pad_width)))
         return emb
 
 
-class TimeEmbedding(nn.Module):
+class TimeEmbedding(nnx.Module):
     """MLP-based time embedding for diffusion timestep t."""
-    
-    dim: int
-    
-    @nn.compact
+
+    def __init__(self, dim: int, rngs: nnx.Rngs):
+        self.fc1 = nnx.Linear(1, dim, rngs=rngs)
+        self.fc2 = nnx.Linear(dim, dim, rngs=rngs)
+
     def __call__(self, t: jnp.ndarray) -> jnp.ndarray:
         """
         Args:
@@ -59,60 +71,108 @@ class TimeEmbedding(nn.Module):
         Returns:
             Time embeddings (batch, dim)
         """
-        x = nn.Dense(self.dim)(t)
-        x = mish(x)  # Exact match to PyTorch nn.Mish()
-        x = nn.Dense(self.dim)(x)
+        x = self.fc1(t)
+        x = mish(x)
+        x = self.fc2(x)
         return x
 
 
-class ContinuousCondEmbedder(nn.Module):
-    """Embed continuous conditioning attributes using attention.
-    
-    Modified from PyTorch reference to embed continuous variables.
-    Matches the implementation from DiT/DiT.py.
-    """
-    
-    attr_dim: int
-    hidden_size: int
-    
-    @nn.compact
-    def __call__(self, attr: jnp.ndarray, mask: Optional[jnp.ndarray] = None) -> jnp.ndarray:
+class ContinuousCondEmbedder(nnx.Module):
+    """Embed continuous conditioning attributes using attention."""
+
+    def __init__(self, attr_dim: int, hidden_size: int, rngs: nnx.Rngs):
+        self.attr_dim = attr_dim
+        self.hidden_size = hidden_size
+        self.embed = nnx.Linear(attr_dim, attr_dim * 128, rngs=rngs)
+        self.attn = nnx.MultiHeadAttention(
+            num_heads=2,
+            in_features=128,
+            qkv_features=128,
+            out_features=128,
+            dropout_rate=0.0,
+            rngs=rngs,
+        )
+        self.out_proj = nnx.Linear(attr_dim * 128, hidden_size, rngs=rngs)
+
+    def __call__(
+        self, attr: jnp.ndarray, mask: Optional[jnp.ndarray] = None
+    ) -> jnp.ndarray:
         """
         Args:
-            attr: (batch, attr_dim) continuous attributes
-            mask: (batch, attr_dim) binary mask (0 = ignore)
+            attr: (batch, attr_dim) or (batch, seq_len, attr_dim) attributes.
+            mask: Optional mask matching attr's leading dimensions.
         Returns:
-            Embedding (batch, hidden_size)
+            Embedding of shape (batch, hidden_size) for 2D input or
+            (batch, seq_len, hidden_size) for time-varying conditioning.
         """
-        # Project each attribute dimension: (batch, attr_dim) -> (batch, attr_dim * 128)
-        # Then reshape to (batch, attr_dim, 128)
-        emb = nn.Dense(self.attr_dim * 128)(attr)  # (batch, attr_dim * 128)
-        emb = emb.reshape((-1, self.attr_dim, 128))  # (batch, attr_dim, 128)
-        
-        if mask is not None:
-            emb = emb * mask[:, :, None]
-        
-        # Self-attention over attribute dimensions
-        emb = nn.MultiHeadDotProductAttention(
-            num_heads=2,
-            qkv_features=128,
-            deterministic=True
-        )(emb, emb)  # (batch, attr_dim, 128)
-        
-        # Flatten and project to hidden size (matches PyTorch version)
-        emb = emb.reshape((-1, self.attr_dim * 128))  # (batch, attr_dim * 128)
-        return nn.Dense(self.hidden_size)(emb)  # (batch, hidden_size)
+        if attr.shape[-1] != self.attr_dim:
+            raise ValueError(f"Expected attr_dim={self.attr_dim}, got {attr.shape[-1]}")
+
+        has_time_axis = attr.ndim == 3
+        if has_time_axis:
+            batch, seq_len, _ = attr.shape
+            attr_flat = attr.reshape((-1, self.attr_dim))
+            mask_flat = None
+            if mask is not None:
+                mask_flat = mask.reshape((-1, self.attr_dim))
+        else:
+            batch = attr.shape[0]
+            seq_len = None
+            attr_flat = attr
+            mask_flat = mask
+
+        emb = self.embed(attr_flat)
+        emb = emb.reshape((-1, self.attr_dim, 128))
+
+        if mask_flat is not None:
+            emb = emb * mask_flat[:, :, None]
+
+        emb = self.attn(emb, deterministic=True, decode=False)
+        emb = emb.reshape((-1, self.attr_dim * 128))
+        emb = self.out_proj(emb)
+
+        if has_time_axis:
+            emb = emb.reshape((batch, seq_len, self.hidden_size))
+
+        return emb
 
 
-class DiTBlock(nn.Module):
+class DiTBlock(nnx.Module):
     """DiT block with adaptive layer norm zero (adaLN-Zero) conditioning."""
-    
-    hidden_size: int
-    n_heads: int
-    dropout: float = 0.1
-    
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, t: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
+
+    def __init__(self, hidden_size: int, n_heads: int, dropout: float, rngs: nnx.Rngs):
+        self.hidden_size = hidden_size
+        self.dropout = dropout
+        self.modulation = nnx.Linear(hidden_size, hidden_size * 6, rngs=rngs)
+        self.attn = nnx.MultiHeadAttention(
+            num_heads=n_heads,
+            in_features=hidden_size,
+            qkv_features=hidden_size,
+            out_features=hidden_size,
+            dropout_rate=dropout,
+            rngs=rngs,
+        )
+        self.norm_msa = nnx.LayerNorm(
+            num_features=hidden_size,
+            use_bias=False,
+            use_scale=False,
+            epsilon=1e-6,
+            rngs=rngs,
+        )
+        self.norm_mlp = nnx.LayerNorm(
+            num_features=hidden_size,
+            use_bias=False,
+            use_scale=False,
+            epsilon=1e-6,
+            rngs=rngs,
+        )
+        self.mlp_fc1 = nnx.Linear(hidden_size, hidden_size * 4, rngs=rngs)
+        self.dropout_layer = nnx.Dropout(rate=dropout, rngs=rngs)
+        self.mlp_fc2 = nnx.Linear(hidden_size * 4, hidden_size, rngs=rngs)
+
+    def __call__(
+        self, x: jnp.ndarray, t: jnp.ndarray, deterministic: bool = True
+    ) -> jnp.ndarray:
         """
         Args:
             x: Input tokens (batch, seq_len, hidden_size)
@@ -121,42 +181,48 @@ class DiTBlock(nn.Module):
         Returns:
             Output tokens (batch, seq_len, hidden_size)
         """
-        # adaLN modulation parameters
-        modulation = nn.Dense(self.hidden_size * 6)(nn.silu(t))
+        modulation = self.modulation(nnx.silu(t))
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(
             modulation, 6, axis=-1
         )
-        
-        # Multi-head self-attention with adaLN
-        norm_x = nn.LayerNorm(use_bias=False, use_scale=False, epsilon=1e-6)(x)
+
+        norm_x = self.norm_msa(x)
         mod_x = modulate(norm_x, shift_msa, scale_msa)
-        attn_out = nn.MultiHeadDotProductAttention(
-            num_heads=self.n_heads,
-            qkv_features=self.hidden_size,
-            dropout_rate=self.dropout if not deterministic else 0.0,
-            deterministic=deterministic
-        )(mod_x, mod_x)
+        attn_out = self.attn(mod_x, deterministic=deterministic, decode=False)
         x = x + gate_msa[:, None, :] * attn_out
-        
-        # MLP with adaLN
-        norm_x2 = nn.LayerNorm(use_bias=False, use_scale=False, epsilon=1e-6)(x)
+
+        norm_x2 = self.norm_mlp(x)
         mod_x2 = modulate(norm_x2, shift_mlp, scale_mlp)
-        mlp_out = nn.Dense(self.hidden_size * 4)(mod_x2)
-        mlp_out = nn.gelu(mlp_out, approximate=True)  # GELU with tanh approximation
-        mlp_out = nn.Dropout(rate=self.dropout, deterministic=deterministic)(mlp_out)
-        mlp_out = nn.Dense(self.hidden_size)(mlp_out)
+        mlp_out = self.mlp_fc1(mod_x2)
+        mlp_out = nnx.gelu(mlp_out, approximate=True)
+        mlp_out = self.dropout_layer(mlp_out, deterministic=deterministic)
+        mlp_out = self.mlp_fc2(mlp_out)
         x = x + gate_mlp[:, None, :] * mlp_out
-        
+
         return x
 
 
-class FinalLayer1d(nn.Module):
+class FinalLayer1d(nnx.Module):
     """Final layer with adaptive layer norm modulation."""
-    
-    hidden_size: int
-    out_dim: int
-    
-    @nn.compact
+
+    def __init__(self, hidden_size: int, out_dim: int, rngs: nnx.Rngs):
+        self.hidden_size = hidden_size
+        self.modulation = nnx.Linear(hidden_size, hidden_size * 2, rngs=rngs)
+        self.norm = nnx.LayerNorm(
+            num_features=hidden_size,
+            use_bias=False,
+            use_scale=False,
+            epsilon=1e-6,
+            rngs=rngs,
+        )
+        self.out = nnx.Linear(
+            hidden_size,
+            out_dim,
+            kernel_init=nnx.initializers.zeros,
+            bias_init=nnx.initializers.zeros,
+            rngs=rngs,
+        )
+
     def __call__(self, x: jnp.ndarray, t: jnp.ndarray) -> jnp.ndarray:
         """
         Args:
@@ -165,125 +231,162 @@ class FinalLayer1d(nn.Module):
         Returns:
             Output (batch, seq_len, out_dim)
         """
-        modulation = nn.Dense(self.hidden_size * 2)(nn.silu(t))
+        modulation = self.modulation(nnx.silu(t))
         shift, scale = jnp.split(modulation, 2, axis=-1)
-        
-        norm_x = nn.LayerNorm(use_bias=False, use_scale=False, epsilon=1e-6)(x)
+        norm_x = self.norm(x)
         mod_x = modulate(norm_x, shift, scale)
-        return nn.Dense(self.out_dim, kernel_init=nn.initializers.zeros)(mod_x)
+        return self.out(mod_x)
 
 
-class DiT1d(nn.Module):
-    """1D Diffusion Transformer for sequence modeling.
-    
-    This model processes sequences with self-attention and is conditioned on
-    time and optional attributes.
-    """
-    
-    x_dim: int
-    d_model: int = 384
-    n_heads: int = 6
-    depth: int = 6
-    dropout: float = 0.1
-    attr_dim: Optional[int] = None
-    
-    @nn.compact
+class DiT1d(nnx.Module):
+    """1D Diffusion Transformer for sequence modeling."""
+
+    def __init__(
+        self,
+        x_dim: int,
+        d_model: int,
+        n_heads: int,
+        depth: int,
+        dropout: float,
+        attr_dim: Optional[int],
+        rngs: nnx.Rngs,
+    ):
+        self.x_dim = x_dim
+        self.d_model = d_model
+        self.depth = depth
+        self.attr_dim = attr_dim
+
+        self.input_proj = nnx.Linear(x_dim, d_model, rngs=rngs)
+        self.pos_emb = SinusoidalPosEmb(d_model)
+        self.time_emb = TimeEmbedding(d_model, rngs=rngs)
+
+        if attr_dim is not None:
+            self.attr_embed = ContinuousCondEmbedder(attr_dim, d_model, rngs=rngs)
+        else:
+            self.attr_embed = None
+
+        for i in range(depth):
+            setattr(
+                self,
+                f"block_{i}",
+                DiTBlock(d_model, n_heads, dropout, rngs=rngs),
+            )
+
+        self.final_layer = FinalLayer1d(d_model, x_dim, rngs=rngs)
+
     def __call__(
         self,
         x: jnp.ndarray,
         t: jnp.ndarray,
         attr: Optional[jnp.ndarray] = None,
         mask: Optional[jnp.ndarray] = None,
-        deterministic: bool = True
+        deterministic: bool = True,
     ) -> jnp.ndarray:
         """
         Args:
             x: Input sequence (batch, seq_len, x_dim)
             t: Time (batch, 1)
-            attr: Optional attributes (batch, attr_dim)
-            mask: Optional attribute mask (batch, attr_dim)
+            attr: Optional attributes (batch, attr_dim or batch, seq, attr_dim)
+            mask: Optional attribute mask
             deterministic: Whether to apply dropout
         Returns:
             Output sequence (batch, seq_len, x_dim)
         """
         batch_size, seq_len, _ = x.shape
-        
-        # Project input to hidden dimension
-        x = nn.Dense(self.d_model)(x)
-        
-        # Add positional embeddings
-        pos_emb = SinusoidalPosEmb(self.d_model)(jnp.arange(seq_len))
+
+        x = self.input_proj(x)
+
+        positions = jnp.arange(seq_len, dtype=jnp.float32)
+        pos_emb = self.pos_emb(positions)
         x = x + pos_emb[None, :, :]
-        
-        # Time embedding
-        t_emb = TimeEmbedding(self.d_model)(t)
-        
-        # Add attribute conditioning if provided
+
+        t_emb = self.time_emb(t)
+
         if attr is not None:
-            assert self.attr_dim is not None, "Model is not conditional"
-            attr_emb = ContinuousCondEmbedder(self.attr_dim, self.d_model)(attr, mask)
-            t_emb = t_emb + attr_emb
-        
-        # Apply transformer blocks
-        for _ in range(self.depth):
-            x = DiTBlock(self.d_model, self.n_heads, self.dropout)(x, t_emb, deterministic)
-        
-        # Final layer
-        x = FinalLayer1d(self.d_model, self.x_dim)(x, t_emb)
-        
+            if self.attr_embed is None:
+                raise ValueError("Model instantiated without attr_dim but attr provided.")
+            attr_emb = self.attr_embed(attr, mask)
+            if attr_emb.ndim == 2:
+                t_emb = t_emb + attr_emb
+            else:
+                x = x + attr_emb
+                t_emb = t_emb + jnp.mean(attr_emb, axis=1)
+
+        for i in range(self.depth):
+            block = getattr(self, f"block_{i}")
+            x = block(x, t_emb, deterministic=deterministic)
+
+        x = self.final_layer(x, t_emb)
         return x
 
 
-class ActionPredictor(nn.Module):
+class ActionPredictor(nnx.Module):
     """
     Action prediction network D_θ for DynaFlow.
-    
+
     Takes a noisy state trajectory X_t, time t, and optional conditioning c,
-    and outputs an action sequence U^.
+    and outputs an action sequence Ũ.
     """
-    
-    state_dim: int
-    action_dim: int
-    d_model: int = 384
-    n_heads: int = 6
-    depth: int = 3
-    dropout: float = 0.1
-    cond_dim: Optional[int] = None
-    
-    @nn.compact
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        d_model: int,
+        n_heads: int,
+        depth: int,
+        dropout: float,
+        cond_dim: Optional[int],
+        rngs: nnx.Rngs,
+    ):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.backbone = DiT1d(
+            x_dim=state_dim,
+            d_model=d_model,
+            n_heads=n_heads,
+            depth=depth,
+            dropout=dropout,
+            attr_dim=cond_dim,
+            rngs=rngs,
+        )
+        self.action_head = nnx.Linear(state_dim, action_dim, rngs=rngs)
+
     def __call__(
         self,
         X_t: jnp.ndarray,
         t: jnp.ndarray,
         cond: Optional[jnp.ndarray] = None,
-        deterministic: bool = True
+        mask: Optional[jnp.ndarray] = None,
+        deterministic: bool = True,
     ) -> jnp.ndarray:
         """
         Args:
             X_t: Noisy state trajectory (batch, H+1, state_dim)
             t: Time (batch, 1)
-            cond: Optional conditioning (batch, cond_dim)
+            cond: Optional conditioning (batch, cond_dim or batch, seq, cond_dim)
+            mask: Optional conditioning mask
             deterministic: Whether to apply dropout
         Returns:
             U_hat: Predicted actions (batch, H, action_dim)
         """
-        # Run DiT backbone on the full state trajectory
-        y = DiT1d(
-            x_dim=self.state_dim,
-            d_model=self.d_model,
-            n_heads=self.n_heads,
-            depth=self.depth,
-            dropout=self.dropout,
-            attr_dim=self.cond_dim
-        )(X_t, t, attr=cond, deterministic=deterministic)
-        
-        # Project each state token to action dimension
-        a_tokens = nn.Dense(self.action_dim)(y)
-        
-        # Use actions for steps 1..H (drop the first token which corresponds to x0)
+        y = self.backbone(X_t, t, attr=cond, mask=mask, deterministic=deterministic)
+        a_tokens = self.action_head(y)
+        a_tokens = jnp.tanh(a_tokens)
         U_hat = a_tokens[:, 1:, :]
-        
         return U_hat
+
+
+@dataclass
+class ActionPredictorHandle:
+    """Callable handle that exposes a Linen-style `.apply` for nnx modules."""
+
+    graphdef: nnx.GraphDef
+    aux_state: nnx.State
+
+    def apply(self, params: nnx.State, *args, **kwargs):
+        module = nnx.merge(self.graphdef, params, self.aux_state)
+        return module(*args, **kwargs)
 
 
 def create_action_predictor(
@@ -294,47 +397,68 @@ def create_action_predictor(
     depth: int = 3,
     horizon: int = 17,
     cond_dim: Optional[int] = None,
-    rng: Optional[jax.random.PRNGKey] = None
-) -> tuple:
+    dropout: float = 0.1,
+    rng: Optional[jax.random.PRNGKey] = None,
+) -> Tuple[ActionPredictorHandle, nnx.State]:
     """
     Create and initialize an ActionPredictor model.
-    
+
     Args:
         state_dim: State dimension
         action_dim: Action dimension
         d_model: Hidden dimension
         n_heads: Number of attention heads
         depth: Number of transformer blocks
+        horizon: Sequence length (H+1)
         cond_dim: Optional conditioning dimension
+        dropout: Dropout probability inside DiT blocks
         rng: Random key for initialization
-    
+
     Returns:
-        (model, params) tuple
+        (model_handle, params_state)
     """
     if rng is None:
         rng = random.PRNGKey(0)
-    
-    model = ActionPredictor(
+
+    rngs = nnx.Rngs(rng)
+    module = ActionPredictor(
         state_dim=state_dim,
         action_dim=action_dim,
         d_model=d_model,
         n_heads=n_heads,
         depth=depth,
-        cond_dim=cond_dim
+        dropout=dropout,
+        cond_dim=cond_dim,
+        rngs=rngs,
     )
-    
-    # Initialize with dummy inputs
-    dummy_X_t = jnp.ones((1, horizon, state_dim))  # H+1 = 17 for horizon 16
+
+    graphdef, params, aux_state = nnx.split(module, nnx.Param, nnx.RngState)
+    model_handle = ActionPredictorHandle(graphdef=graphdef, aux_state=aux_state)
+
+    # Force materialization via a dummy call to ensure arrays are initialized.
+    dummy_X_t = jnp.ones((1, horizon, state_dim))
     dummy_t = jnp.ones((1, 1))
     dummy_cond = jnp.ones((1, cond_dim)) if cond_dim else None
-    
-    # Split RNG for params and dropout
-    init_rng, dropout_rng = random.split(rng)
-    params = model.init({'params': init_rng, 'dropout': dropout_rng}, dummy_X_t, dummy_t, cond=dummy_cond, deterministic=True)
-    
-    return model, params
+    _ = model_handle.apply(params, dummy_X_t, dummy_t, cond=dummy_cond, deterministic=True)
+
+    return model_handle, params
 
 
-def count_parameters(params) -> int:
+def count_parameters(params: nnx.State) -> int:
     """Count the number of parameters in a model."""
-    return sum(x.size for x in jax.tree_util.tree_leaves(params))
+    return sum(int(x.size) for x in jax.tree_util.tree_leaves(params))
+
+
+def params_to_bytes(params: nnx.State) -> bytes:
+    """Serialize nnx parameter state to bytes for checkpointing."""
+    pure = statelib.to_pure_dict(params)
+    return serialization.to_bytes(pure)
+
+
+def bytes_to_params(data: Union[bytes, jnp.ndarray], template: nnx.State) -> nnx.State:
+    """Deserialize bytes into the nnx parameter State using a template."""
+    pure_template = statelib.to_pure_dict(template)
+    pure_params = serialization.from_bytes(pure_template, data)
+    restored = copy.deepcopy(template)
+    statelib.replace_by_pure_dict(restored, pure_params)
+    return restored
