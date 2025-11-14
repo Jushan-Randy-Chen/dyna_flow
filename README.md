@@ -114,7 +114,7 @@ np.savez(
 
 ```
 python train_flow_matching.py \
-    --data logs/ppo_policy2/trajectories/trajectories.npz \
+    --data logs/ppo_policy/trajectories/trajectories.npz \
     --wandb online \
     --wandb-project dynaflow-go2
 
