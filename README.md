@@ -116,23 +116,14 @@ np.savez(
 
 ## 🎓 Training
 
-### Basic Training
-
-```bash
-python train_flow_matching.py \
-  --data logs/ppo_policy/trajectories/trajectories.npz \
-  --epochs 100 \
-  --batch 64 \
-  --horizon 10
-```
-
 ### Full Training Configuration
 
-```bash
+```
 python train_flow_matching.py \
     --data logs/ppo_policy2/trajectories/trajectories.npz \
     --wandb online \
     --wandb-project dynaflow-go2
+
 ```
 (you can disable wandb by ``--wandb disabled`)
 ### Training Parameters
@@ -173,7 +164,7 @@ python train_flow_matching.py \
 
 ---
 
-## 📊 Evaluation & Sampling
+<!-- ## 📊 Evaluation & Sampling
 
 ### Evaluate on Test Set
 
@@ -185,7 +176,7 @@ python evaluate.py \
   --batch 32 \
   --ode-steps 1 \
   --use-ema
-```
+``` -->
 
 ## 🏗️ Architecture
 
