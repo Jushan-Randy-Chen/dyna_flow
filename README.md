@@ -78,20 +78,14 @@ python -c "import jax; import mujoco; from mujoco import mjx; print('✓ Ready t
 
 **Option A: Train PPO Policy** (Recommended)
 
-Train a PPO policy to collect high-quality demonstrations:
+Train an expert PPO policy to collect high-quality demonstrations:
 
 ```bash
 # Train policy (1-2 hours on GPU)
-python train_ppo.py \
-  --exp_name go2-locomotion \
-  --num_envs 4096 \
-  --max_iterations 10000
+python python train_brax.py 
 
 # Collect trajectories from trained policy
-python collect_trajectories_parallel.py \
-  --checkpoint logs/go2-locomotion/model_10000.pt \
-  --num-episodes 10000 \
-  --output logs/go2-locomotion/trajectories/trajectories.npz
+python collect_trajectories_parallel.py --exp_name ppo_policy
 ```
 
 **Option B: Use Existing Data**

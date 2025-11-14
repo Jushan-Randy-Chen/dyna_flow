@@ -310,21 +310,4 @@ python train_brax.py --num_envs 4096 --num_timesteps 50_000_000
 
 # Very fast testing/debugging:
 python train_brax.py --num_envs 2048 --num_timesteps 10_000_000 --exp_name test_run
-
-# High-quality training (if you have an A100 or better):
-python train_brax.py --num_envs 8192 --num_timesteps 100_000_000 --unroll_length 30
-
-# Custom experiment name:
-python train_brax.py --exp_name my_go2_experiment
-
-# With custom XML:
-python train_brax.py --xml-path /path/to/custom/go2.xml
-
-Expected performance:
-- RTX 4080: ~50,000-100,000 steps/sec (50M steps in ~10-20 min)
-- A100: ~200,000+ steps/sec (50M steps in ~5 min)
-
-Compare to old rsl_rl approach:
-- RTX 4080: ~500-1000 steps/sec (same training would take 14+ hours!)
-- 50-100x speedup! 🚀
 """
