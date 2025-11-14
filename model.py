@@ -122,14 +122,14 @@ class ContinuousCondEmbedder(nnx.Module):
             mask_flat = mask
 
         emb = self.embed(attr_flat)
-        emb = emb.reshape((-1, self.attr_dim, 128))
+        emb = emb.reshape((-1, self.attr_dim, 128)) # (b, attr_dim, 128)
 
         if mask_flat is not None:
             emb = emb * mask_flat[:, :, None]
 
-        emb = self.attn(emb, deterministic=True, decode=False)
-        emb = emb.reshape((-1, self.attr_dim * 128))
-        emb = self.out_proj(emb)
+        emb = self.attn(emb, deterministic=True, decode=False) # (b, attr_dim, 128)
+        emb = emb.reshape((-1, self.attr_dim * 128)) 
+        emb = self.out_proj(emb) # (b, hidden_size)
 
         if has_time_axis:
             emb = emb.reshape((batch, seq_len, self.hidden_size))
@@ -258,10 +258,10 @@ class DiT1d(nnx.Module):
 
         self.input_proj = nnx.Linear(x_dim, d_model, rngs=rngs)
         self.pos_emb = SinusoidalPosEmb(d_model)
-        self.time_emb = TimeEmbedding(d_model, rngs=rngs)
+        self.time_emb = TimeEmbedding(d_model, rngs=rngs) # (b, hidden_size)
 
         if attr_dim is not None:
-            self.attr_embed = ContinuousCondEmbedder(attr_dim, d_model, rngs=rngs)
+            self.attr_embed = ContinuousCondEmbedder(attr_dim, d_model, rngs=rngs) # (b, hidden_size)
         else:
             self.attr_embed = None
 
@@ -294,10 +294,10 @@ class DiT1d(nnx.Module):
         """
         batch_size, seq_len, _ = x.shape
 
-        x = self.input_proj(x)
+        x = self.input_proj(x) 
 
         positions = jnp.arange(seq_len, dtype=jnp.float32)
-        pos_emb = self.pos_emb(positions)
+        pos_emb = self.pos_emb(positions) #(b, seq_len, hidden_size)
         x = x + pos_emb[None, :, :]
 
         t_emb = self.time_emb(t)
@@ -307,8 +307,15 @@ class DiT1d(nnx.Module):
                 raise ValueError("Model instantiated without attr_dim but attr provided.")
             attr_emb = self.attr_embed(attr, mask)
             if attr_emb.ndim == 2:
+                # Global conditioning vector: fold into time embedding for adaLN.
                 t_emb = t_emb + attr_emb
             else:
+                if attr_emb.shape[1] != seq_len:
+                    raise ValueError(
+                        f"Conditioning sequence length {attr_emb.shape[1]} "
+                        f"does not match token sequence length {seq_len}."
+                    )
+                # Per-token conditioning: add to token stream and summarize for adaLN.
                 x = x + attr_emb
                 t_emb = t_emb + jnp.mean(attr_emb, axis=1)
 

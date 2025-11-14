@@ -51,7 +51,7 @@ def compute_normalization_stats(trajectories: jnp.ndarray) -> dict:
     # We compute mean/std over batch and time for non-quaternion dims and
     # set quaternion dims' mean=0, std=1 so they are left unchanged by z-score.
     # This preserves the unit-norm manifold structure of quaternions.
-    trajectories = jnp.nan_to_num(trajectories, nan=0.0, posinf=0.0, neginf=0.0)
+    # trajectories = jnp.nan_to_num(trajectories, nan=0.0, posinf=0.0, neginf=0.0)
     D = trajectories.shape[-1]
     idx = jnp.arange(D)
     non_quat_mask = jnp.logical_or(idx < 3, idx >= 7)  # True for dims to normalize
@@ -60,8 +60,8 @@ def compute_normalization_stats(trajectories: jnp.ndarray) -> dict:
     sel = trajectories[..., non_quat_mask]
     mean_sel = jnp.mean(sel, axis=(0, 1))
     std_sel = jnp.std(sel, axis=(0, 1), ddof=0)
-    mean_sel = jnp.nan_to_num(mean_sel, nan=0.0)
-    std_sel = jnp.nan_to_num(std_sel, nan=1.0, posinf=1.0, neginf=1.0)
+    # mean_sel = jnp.nan_to_num(mean_sel, nan=0.0)
+    # std_sel = jnp.nan_to_num(std_sel, nan=1.0, posinf=1.0, neginf=1.0)
     std_sel = jnp.clip(std_sel, a_min=1e-6)
     
     # Build full mean/std arrays where quaternion dims have mean=0 and std=1
@@ -81,11 +81,11 @@ def compute_normalization_stats_cond(trajectories: jnp.ndarray) -> dict:
     Returns:
         Dictionary with 'mean' and 'std' arrays of shape (cond_dim,)
     """
-    trajectories = jnp.nan_to_num(trajectories, nan=0.0, posinf=0.0, neginf=0.0)
+    # trajectories = jnp.nan_to_num(trajectories, nan=0.0, posinf=0.0, neginf=0.0)
     mean = jnp.mean(trajectories, axis=(0, 1))
     std = jnp.std(trajectories, axis=(0, 1), ddof=0)
-    mean = jnp.nan_to_num(mean, nan=0.0)
-    std = jnp.nan_to_num(std, nan=1.0, posinf=1.0, neginf=1.0)
+    # mean = jnp.nan_to_num(mean, nan=0.0)
+    # std = jnp.nan_to_num(std, nan=1.0, posinf=1.0, neginf=1.0)
     std = jnp.clip(std, a_min=1e-6)
     return {'mean': mean, 'std': std}
 
@@ -114,7 +114,7 @@ def normalize_states(x: jnp.ndarray, stats: dict) -> jnp.ndarray:
     
     # Enforce quaternion unit-norm for numeric stability
     x_norm = normalize_quat(x_norm)
-    return jnp.nan_to_num(x_norm, nan=0.0, posinf=0.0, neginf=0.0)
+    return x_norm
 
 def create_train_state(
     rng: jax.Array,
@@ -399,11 +399,9 @@ def main():
     # Normalize dataset once
     print("\nNormalizing dataset...")
     all_trajectories = normalize_states(all_trajectories, norm_stats)
-    all_trajectories = jnp.nan_to_num(all_trajectories, nan=0.0, posinf=0.0, neginf=0.0)
     if all_conds is not None:
         cond_std = jnp.clip(norm_stats_cond['std'], a_min=1e-6)
         all_conds = (all_conds - norm_stats_cond['mean']) / cond_std
-        all_conds = jnp.nan_to_num(all_conds, nan=0.0, posinf=0.0, neginf=0.0)
     
     # Compute sigma_data from normalized data
     sigma_data = float(jnp.std(all_trajectories))
@@ -497,13 +495,7 @@ def main():
             
             # Training step
             rng, step_rng = random.split(rng)
-            # # Simple t-curriculum: linearly decay t_floor from 0.9 to 0.0 over first 20% epochs
-            # progress = (epoch + 1) / max(1, args.epochs)
-            # if progress < 0.2:
-            #     t_floor = 0.9 * (1.0 - progress / 0.2)
-            # else:
-            #     t_floor = 0.0
-
+    
             params, opt_state, loss, grad_norm, _, ema_params, _ = train_step(
                 model_fn=model.apply,
                 rollout_op=rollout,
