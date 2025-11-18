@@ -217,13 +217,78 @@ def train_step(
     
     # Update EMA parameters if enabled
     if ema_params is not None and ema_decay is not None:
-        ema_params = jax.tree.map(
-            lambda ema, new: ema_decay * ema + (1.0 - ema_decay) * new,
-            ema_params,
-            params
+    #     ema_params = jax.tree.map(
+    #         lambda ema, new: ema_decay * ema + (1.0 - ema_decay) * new,
+    #         ema_params,
+    #         params
+    #     )
+    
+        ema_params = optax.incremental_update(
+            new_tensors=params,
+            old_tensors=ema_params,
+            step_size= 1.0 - ema_decay,
         )
     
     return params, opt_state, loss, grad_norm, rng, ema_params, per_dim_mse
+
+
+@partial(jax.jit, static_argnames=('model_fn', 'rollout_op'))
+def eval_step(
+    model_fn: Any,
+    rollout_op: MuJoCoGo2Rollout,
+    params: Any,
+    x1_demo: jnp.ndarray,
+    cond: Optional[jnp.ndarray],
+    rng: jax.Array,
+    norm_stats: dict,
+) -> Tuple[jnp.ndarray, dict]:
+    """Evaluation step without parameter updates."""
+    noise_key, t_key = random.split(rng, 2)
+    x0 = random.normal(noise_key, x1_demo.shape)
+    x0 = x0.at[:, 0, :].set(x1_demo[:, 0, :])
+    x0 = normalize_quat(x0)
+    t = random.uniform(t_key, (x1_demo.shape[0], 1), minval=0.0, maxval=1.0)
+    cond_norm = cond
+    loss, aux_dict = conditional_matching_loss(
+        model_fn, params, rollout_op, x0, x1_demo, t, cond=cond_norm, norm_stats=norm_stats
+    )
+    return loss, aux_dict
+
+
+def run_evaluation(
+    model_fn: Any,
+    rollout_op: MuJoCoGo2Rollout,
+    params: Any,
+    eval_states: jnp.ndarray,
+    eval_cond: Optional[jnp.ndarray],
+    norm_stats: dict,
+    batch_size: int,
+    rng: jax.Array,
+) -> Tuple[Optional[float], jax.Array]:
+    """Evaluate the model on the held-out split."""
+    n_eval = int(eval_states.shape[0])
+    if n_eval == 0:
+        return None, rng
+    
+    steps = max(1, int(np.ceil(n_eval / batch_size)))
+    total_loss = 0.0
+    for step in range(steps):
+        start = step * batch_size
+        end = min((step + 1) * batch_size, n_eval)
+        x_batch = eval_states[start:end]
+        cond_batch = eval_cond[start:end] if eval_cond is not None else None
+        rng, step_rng = random.split(rng)
+        loss, _ = eval_step(
+            model_fn=model_fn,
+            rollout_op=rollout_op,
+            params=params,
+            x1_demo=x_batch,
+            cond=cond_batch,
+            rng=step_rng,
+            norm_stats=norm_stats,
+        )
+        total_loss += float(loss)
+    return total_loss / steps, rng
 
 
 def main():
@@ -360,13 +425,15 @@ def main():
         max_windows=max_windows,
     )
     
-    state_dim = dataset.state_dim #37
-    cond_dim = dataset.cond_dim #36
+    state_dim = dataset.state_dim
+    cond_dim = dataset.cond_dim
+    model_input_dim = state_dim + (cond_dim or 0)
     n_samples = len(dataset)
     
     print(f"✓ Loaded {n_samples} trajectory windows")
     print(f"  State dim: {state_dim}")
     print(f"  Cond dim: {cond_dim}")
+    print(f"  Model input dim: {model_input_dim}")
     print(f"  Horizon: {dataset.horizon}")
     
     # Pre-load entire dataset to GPU for faster training
@@ -378,7 +445,8 @@ def main():
     all_trajectories = jnp.array(all_data['trajectories'])  # Transfer once to GPU
     all_conds = jnp.array(all_data['cond']) if 'cond' in all_data else None
 
-    print(f'trajectories has shape {all_trajectories.shape}, conditioning has shape {all_conds.shape}')
+    cond_shape = all_conds.shape if all_conds is not None else None
+    print(f'trajectories has shape {all_trajectories.shape}, conditioning has shape {cond_shape}')
     print(f"✓ Dataset on GPU: {all_trajectories.devices()}")
     print(f"  Memory: {all_trajectories.nbytes / 1e9:.2f} GB")
     
@@ -409,6 +477,35 @@ def main():
     print(f"✓ Dataset normalized on GPU")
     print(f"  sigma_data (global std of normalized data): {sigma_data:.3f}")
     
+    # Create 80/20 train/eval split
+    rng, split_rng = random.split(rng)
+    if n_samples > 1:
+        perm = random.permutation(split_rng, n_samples)
+        split_idx = max(1, int(0.8 * n_samples))
+        split_idx = min(split_idx, n_samples - 1)
+    else:
+        perm = jnp.arange(n_samples)
+        split_idx = n_samples
+    train_indices = perm[:split_idx]
+    eval_indices = perm[split_idx:]
+    
+    train_states = all_trajectories[train_indices]
+    eval_states = all_trajectories[eval_indices] if eval_indices.size > 0 else jnp.zeros(
+        (0, all_trajectories.shape[1], all_trajectories.shape[2]), dtype=all_trajectories.dtype
+    )
+    if all_conds is not None:
+        train_cond = all_conds[train_indices]
+        eval_cond = all_conds[eval_indices] if eval_indices.size > 0 else jnp.zeros(
+            (0, all_conds.shape[1], all_conds.shape[2]), dtype=all_conds.dtype
+        )
+    else:
+        train_cond = None
+        eval_cond = None
+    
+    n_train = int(train_states.shape[0])
+    n_eval = int(eval_states.shape[0])
+    print(f"\nDataset split: {n_train} train / {n_eval} eval samples (80/20)")
+    
     
     # Setup rollout operator
     print("\nInitializing rollout operator...")
@@ -423,9 +520,9 @@ def main():
     
     model, params, optimizer, opt_state, ema_params = create_train_state(
         rng=init_rng,
-        state_dim=state_dim,
+        state_dim=model_input_dim,
         action_dim=action_dim,
-        cond_dim=cond_dim,
+        cond_dim=None,
         learning_rate=args.lr,
         horizon=args.horizon,
         ema_decay=ema_decay,
@@ -452,6 +549,7 @@ def main():
                     "lr": args.lr,
                     "ema_decay": args.ema_decay,
                     "state_dim": state_dim,
+                    "model_input_dim": model_input_dim,
                     "action_dim": action_dim,
                     "cond_dim": cond_dim,
                     "n_samples": n_samples,
@@ -467,14 +565,14 @@ def main():
     print("=" * 80 + "\n")
     
     global_step = 0
-    steps_per_epoch = n_samples // args.batch
+    steps_per_epoch = max(1, n_train // args.batch)
     
     epoch_bar = tqdm(range(args.epochs), desc="Epochs")
     
     for epoch in epoch_bar:
         # Shuffle dataset
         rng, shuffle_rng = random.split(rng)
-        indices = random.permutation(shuffle_rng, n_samples)
+        indices = random.permutation(shuffle_rng, n_train)
         
         epoch_loss = 0.0
         batch_bar = tqdm(
@@ -490,8 +588,8 @@ def main():
             batch_indices = indices[batch_start:batch_end]
             
             # Note: data is already normalized
-            x1_demo = all_trajectories[batch_indices]
-            cond = all_conds[batch_indices] if all_conds is not None else None
+            x1_demo = train_states[batch_indices]
+            cond = train_cond[batch_indices] if train_cond is not None else None
             
             # Training step
             rng, step_rng = random.split(rng)
@@ -559,6 +657,30 @@ def main():
             except Exception:
                 pass
         
+        eval_loss = None
+        if n_eval > 0:
+            eval_params = ema_params if ema_params is not None else params
+            eval_loss, rng = run_evaluation(
+                model_fn=model.apply,
+                rollout_op=rollout,
+                params=eval_params,
+                eval_states=eval_states,
+                eval_cond=eval_cond,
+                norm_stats=norm_stats,
+                batch_size=args.batch,
+                rng=rng,
+            )
+            if eval_loss is not None:
+                print(f"  Eval loss: {eval_loss:.4f}")
+                if wandb_run:
+                    try:
+                        wandb.log(
+                            {"eval/loss": eval_loss, "epoch": epoch + 1},
+                            step=global_step,
+                        )
+                    except Exception:
+                        pass
+        
         # Save checkpoint periodically
         if (epoch + 1) % args.save_interval == 0:
             ckpt_params = ema_params if ema_params is not None else params
@@ -577,6 +699,7 @@ def main():
                 "epoch": int(epoch + 1),
                 "global_step": int(global_step),
                 "state_dim": int(state_dim),
+                "model_input_dim": int(model_input_dim),
                 "action_dim": int(action_dim),
                 "horizon": int(args.horizon),
                 "cond_dim": int(cond_dim) if cond_dim is not None else -1,
@@ -611,6 +734,7 @@ def main():
     save_dict = {
         'model': model_bytes,
         'state_dim': state_dim,
+        'model_input_dim': model_input_dim,
         'action_dim': action_dim,
         'horizon': args.horizon,
         'cond_dim': cond_dim if cond_dim is not None else -1,

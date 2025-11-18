@@ -120,12 +120,12 @@ def load_trajectory_dataset(
                 if has_cond is None and cond_ep is not None:
                     has_cond = True
                     cond_dim = cond_ep.shape[-1]
-        elif arr.ndim == 2:
-            # Single trajectory (T, state_dim)
-            _extract_windows(arr, cond_arr, horizon, stride, windows, cond_windows)
-            if has_cond is None and cond_arr is not None:
-                has_cond = True
-                cond_dim = cond_arr.shape[-1]
+        # elif arr.ndim == 2:
+        #     # Single trajectory (T, state_dim)
+        #     _extract_windows(arr, cond_arr, horizon, stride, windows, cond_windows)
+        #     if has_cond is None and cond_arr is not None:
+        #         has_cond = True
+        #         cond_dim = cond_arr.shape[-1]
         elif arr.ndim == 3:
             # Batched trajectories (N, T, state_dim)
             for i in range(arr.shape[0]):

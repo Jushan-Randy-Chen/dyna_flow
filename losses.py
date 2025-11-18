@@ -170,17 +170,25 @@ def conditional_matching_loss(
     # Interpolate to get X_t
     X_t = interpolate_xt(x0, x1_demo, t)  # (batch, H+1, state_dim) -- normalized!
     
+    if cond is not None:
+        if cond.shape[:2] != X_t.shape[:2]:
+            raise ValueError(
+                f"Conditioning shape {cond.shape[:2]} must match states {X_t.shape[:2]}"
+            )
+        model_tokens = jnp.concatenate([X_t, cond], axis=-1)
+    else:
+        model_tokens = X_t
+
     # Predict actions using action predictor (deterministic, no dropout)
     """
-    The model takes normalized states as input but outputs 
-    actions in the raw action space that the simulator expects.
-    Because the loss function compares predicted and demo trajectories, with the simulator acting as a bridge
+    The model takes normalized states (optionally concatenated with conditioning)
+    as input but outputs actions in the raw action space that the simulator expects.
+    Because the loss function compares predicted and demo trajectories, the simulator acts as a bridge.
     """
     U_hat = action_predictor_apply(
         params,
-        X_t,
+        model_tokens,
         t,
-        cond=cond,
         deterministic=True
     )  # (batch, H, action_dim)
     U_hat = U_hat
@@ -215,58 +223,58 @@ def conditional_matching_loss(
     # Special handling for quaternion components (indices 3:7):
     # Quaternions have sign ambiguity (q and -q represent same rotation).
     # To compute a consistent Euclidean-style difference (chordal distance)
-    # we align signs by flipping predicted quaternions where the dot with
-    # the demo quaternion is negative, then subtract component-wise.
+    # # we align signs by flipping predicted quaternions where the dot with
+    # # the demo quaternion is negative, then subtract component-wise.
 
-    q_hat = X1_hat[..., 3:7]  # quaternion component!
-    q_demo = x1_demo[..., 3:7]  # quaternion component from expert traj!
+    # q_hat = X1_hat[..., 3:7]  # quaternion component!
+    # q_demo = x1_demo[..., 3:7]  # quaternion component from expert traj!
 
-    # Ensure unit length (numerical safety) -- should already be normalized
-    q_hat = q_hat / jnp.linalg.norm(q_hat, axis=-1, keepdims=True).clip(min=1e-6)
-    q_demo = q_demo / jnp.linalg.norm(q_demo, axis=-1, keepdims=True).clip(min=1e-6)
+    # # Ensure unit length (numerical safety) -- should already be normalized
+    # q_hat = q_hat / jnp.linalg.norm(q_hat, axis=-1, keepdims=True).clip(min=1e-6)
+    # q_demo = q_demo / jnp.linalg.norm(q_demo, axis=-1, keepdims=True).clip(min=1e-6)
 
-    dot = jnp.sum(q_hat * q_demo, axis=-1, keepdims=True)
-    # If dot < 0, flip q_hat to maximize alignment
-    sign = jnp.where(dot < 0.0, -1.0, 1.0)
-    q_hat_aligned = q_hat * sign
+    # dot = jnp.sum(q_hat * q_demo, axis=-1, keepdims=True)
+    # # If dot < 0, flip q_hat to maximize alignment
+    # sign = jnp.where(dot < 0.0, -1.0, 1.0)
+    # q_hat_aligned = q_hat * sign
 
-    # Build aligned prediction array for subtraction
-    X1_hat_aligned = X1_hat.at[..., 3:7].set(q_hat_aligned)
+    # # Build aligned prediction array for subtraction
+    # X1_hat_aligned = X1_hat.at[..., 3:7].set(q_hat_aligned)
 
-    # Compute quaternion angular error (scalar) and use it in the loss.
-    # Align q_hat sign to q_demo to remove q ~ -q ambiguity (dot may be negative).
-    q_hat = X1_hat_aligned[..., 3:7]
-    q_demo = x1_demo[..., 3:7]
+    # # Compute quaternion angular error (scalar) and use it in the loss.
+    # # Align q_hat sign to q_demo to remove q ~ -q ambiguity (dot may be negative).
+    # q_hat = X1_hat_aligned[..., 3:7]
+    # q_demo = x1_demo[..., 3:7]
 
-    # Ensure unit length (numerical safety)
-    q_hat = q_hat / jnp.linalg.norm(q_hat, axis=-1, keepdims=True).clip(min=1e-6)
-    q_demo = q_demo / jnp.linalg.norm(q_demo, axis=-1, keepdims=True).clip(min=1e-6)
-    dot = jnp.sum(q_hat * q_demo, axis=-1, keepdims=True)  # (batch, H+1, 1)
-    dot_clipped = jnp.clip(dot, -1.0, 1.0)
+    # # Ensure unit length (numerical safety)
+    # q_hat = q_hat / jnp.linalg.norm(q_hat, axis=-1, keepdims=True).clip(min=1e-6)
+    # q_demo = q_demo / jnp.linalg.norm(q_demo, axis=-1, keepdims=True).clip(min=1e-6)
+    # dot = jnp.sum(q_hat * q_demo, axis=-1, keepdims=True)  # (batch, H+1, 1)
+    # dot_clipped = jnp.clip(dot, -1.0, 1.0)
 
-    # Avoid NaNs from arccos'(x) at |x| = 1 by contracting the range slightly.
-    dot_safe = jnp.clip(dot_clipped, a_min=-1.0 + 1e-4, a_max=1.0 - 1e-4)
-    angle = 2.0 * jnp.arccos(dot_safe)  # (batch, H+1, 1)
-    angle_sq = angle ** 2  # (batch, H+1, 1)
+    # # Avoid NaNs from arccos'(x) at |x| = 1 by contracting the range slightly.
+    # dot_safe = jnp.clip(dot_clipped, a_min=-1.0 + 1e-4, a_max=1.0 - 1e-4)
+    # angle = 2.0 * jnp.arccos(dot_safe)  # (batch, H+1, 1)
+    # angle_sq = angle ** 2  # (batch, H+1, 1)
 
-    # Prepare component-wise diff but zero quaternion components (we'll add angular term separately)
-    diff = X1_hat_aligned - x1_demo
-    diff_nonquat = diff.at[..., 3:7].set(0.0)
+    # # Prepare component-wise diff but zero quaternion components (we'll add angular term separately)
+    # diff = X1_hat_aligned - x1_demo
+    # diff_nonquat = diff.at[..., 3:7].set(0.0)
     
 
-    weighted_diff_sq_nonquat = weight_mask * (diff_nonquat ** 2)  # non-quaternion component of error
-    weight_mask_nonquat = weight_mask.at[..., 3:7].set(0.0)
-    total_weight_nonquat = weight_mask_nonquat.sum()
+    # weighted_diff_sq_nonquat = weight_mask * (diff_nonquat ** 2)  # non-quaternion component of error
+    # weight_mask_nonquat = weight_mask.at[..., 3:7].set(0.0)
+    # total_weight_nonquat = weight_mask_nonquat.sum()
 
-    # Quaternion weights: mean mask value across the 4 quaternion channels -- optional, since the weights are usually 1.0
-    w_q = weight_mask[..., 3:7].mean(axis=-1)  # (batch, H+1)
-    w_q = w_q.at[:, 0].set(0.0)  # ignore first time step in the horizon
-    angle_sq = angle_sq[..., 0]  # squeeze last dim -> (batch, H+1)
-    quat_contrib = (w_q * angle_sq).sum()
-    total_weight_quat = jnp.maximum(w_q.sum(), 1e-6)
+    # # Quaternion weights: mean mask value across the 4 quaternion channels -- optional, since the weights are usually 1.0
+    # w_q = weight_mask[..., 3:7].mean(axis=-1)  # (batch, H+1)
+    # w_q = w_q.at[:, 0].set(0.0)  # ignore first time step in the horizon
+    # angle_sq = angle_sq[..., 0]  # squeeze last dim -> (batch, H+1)
+    # quat_contrib = (w_q * angle_sq).sum()
+    # total_weight_quat = jnp.maximum(w_q.sum(), 1e-6)
 
-    total_weight = jnp.maximum(total_weight_nonquat + total_weight_quat, 1e-6)
-    loss = (weighted_diff_sq_nonquat.sum() + quat_contrib) / total_weight
+    # total_weight = jnp.maximum(total_weight_nonquat + total_weight_quat, 1e-6)
+    # loss = (weighted_diff_sq_nonquat.sum() + quat_contrib) / total_weight
 
     # per_dim_weight = weighted_mask.sum(axis=(0, 1))
     # per_dim_weighted_mse_nonquat = jnp.where(
@@ -285,6 +293,11 @@ def conditional_matching_loss(
     # quat_unweighted_mse_scalar = angle_sq.mean()
     # per_dim_unweighted_mse = per_dim_unweighted_mse_nonquat.at[3:7].set(quat_unweighted_mse_scalar)
     
+
+
+    diff = X1_hat - x1_demo
+    loss_numerator = weight_mask * diff**2
+    loss = loss_numerator.sum() / jnp.maximum(weight_mask.sum(), 1e-6)
     # Auxiliary outputs for monitoring
     aux = {
         'x1_hat': X1_hat,
@@ -360,7 +373,7 @@ def ode_step(
     rollout_fn: Callable,
     t: jnp.ndarray,
     dt: float = 1.0,
-    cond: Optional[jnp.ndarray] = None,
+        cond: Optional[jnp.ndarray] = None,
     norm_stats: Optional[dict] = None
 ) -> jnp.ndarray:
     """
@@ -381,11 +394,11 @@ def ode_step(
         Updated trajectory (batch, H+1, state_dim) - NORMALIZED
     """
     # Predict actions
+    model_tokens = jnp.concatenate([x_t, cond], axis=-1) if cond is not None else x_t
     U_hat = action_predictor_apply(
         params,
-        x_t,
+        model_tokens,
         t,
-        cond=cond,
         deterministic=True
     )
     
@@ -431,7 +444,7 @@ def sample_trajectory(
         x0: Initial states (batch, state_dim) - NORMALIZED if norm_stats provided
         horizon: Trajectory horizon H
         state_dim: State dimension
-        cond: Optional conditioning (batch, cond_dim)
+        cond: Optional per-timestep conditioning (batch, H+1, cond_dim)
         ode_steps: Number of Euler substeps (1 = single step)
         noise_scale: Scale of initial Gaussian noise
         rng: Random key for sampling initial noise
@@ -470,11 +483,11 @@ def sample_trajectory(
     
     # Final action prediction at t=1
     t_final = jnp.ones((batch_size, 1))
+    model_tokens = jnp.concatenate([X_cur, cond], axis=-1) if cond is not None else X_cur
     U_sampled = action_predictor_apply(
         params,
-        X_cur,
+        model_tokens,
         t_final,
-        cond=cond,
         deterministic=True
     )
     

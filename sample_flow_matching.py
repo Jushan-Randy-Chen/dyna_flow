@@ -42,7 +42,7 @@ def sample_trajectory(
     params,
     rollout_op: MuJoCoGo2Rollout,
     x0: jnp.ndarray,
-    cond: Optional[jnp.ndarray],
+    cond_seq: Optional[jnp.ndarray],
     n_steps: int = 50,
     rng: Optional[jax.random.PRNGKey] = None,
 ) -> jnp.ndarray:
@@ -57,7 +57,7 @@ def sample_trajectory(
         params: Model parameters
         rollout_op: Rollout operator
         x0: Initial state (batch, state_dim)
-        cond: Optional conditioning (batch, cond_dim)
+        cond_seq: Optional per-timestep conditioning (batch, H+1, cond_dim)
         n_steps: Number of refinement steps
         rng: Random key
     Returns:
@@ -83,11 +83,11 @@ def sample_trajectory(
         t = jnp.ones((batch_size, 1)) * (i * dt)
         
         # Predict actions
+        model_tokens = jnp.concatenate([X_t, cond_seq], axis=-1) if cond_seq is not None else X_t
         U_hat = model_apply(
             params,
-            X_t,
+            model_tokens,
             t,
-            cond=cond,
             deterministic=True,
         )
         
@@ -160,22 +160,37 @@ def main():
     print("\nLoading model...")
     data = np.load(args.model, allow_pickle=True)
     
+    def _maybe_get(key: str):
+        if key not in data.files:
+            return None
+        value = data[key]
+        if isinstance(value, np.ndarray) and value.shape == () and value.dtype == object:
+            return value.item()
+        return value
+    
     state_dim = int(data['state_dim'])
     action_dim = int(data['action_dim'])
     horizon = int(data['horizon'])
     cond_dim = int(data['cond_dim']) if data['cond_dim'] != -1 else None
+    if 'model_input_dim' in data.files:
+        model_input_dim = int(data['model_input_dim'])
+    else:
+        model_input_dim = state_dim + (cond_dim or 0)
+    cond_norm_mean = _maybe_get('cond_norm_mean')
+    cond_norm_std = _maybe_get('cond_norm_std')
     
     print(f"  State dim: {state_dim}")
     print(f"  Action dim: {action_dim}")
     print(f"  Horizon: {horizon}")
     print(f"  Cond dim: {cond_dim}")
+    print(f"  Model input dim: {model_input_dim}")
     
     # Recreate model architecture
     rng = random.PRNGKey(args.seed)
     model, init_params = create_action_predictor(
-        state_dim=state_dim,
+        state_dim=model_input_dim,
         action_dim=action_dim,
-        cond_dim=cond_dim,
+        cond_dim=None,
         rng=rng,
     )
     
@@ -199,13 +214,20 @@ def main():
     default_joints = jnp.array([0.0, 0.9, -1.8] * 4)  # 12 joints
     x0 = x0.at[:, 7:19].set(default_joints[None, :])
     
-    # Optional conditioning
-    if args.commands:
-        cond = jnp.tile(jnp.array(args.commands)[None, :], (args.n_samples, 1))
-        print(f"Using commands: {args.commands}")
-    else:
-        cond = None if cond_dim is None else jnp.zeros((args.n_samples, cond_dim))
-    
+    # Optional conditioning sequences concatenated with states
+    cond_seq = None
+    if cond_dim is not None and cond_dim > 0:
+        cond_seq = jnp.zeros((args.n_samples, horizon + 1, cond_dim), dtype=jnp.float32)
+        if args.commands:
+            cmd = jnp.array(args.commands, dtype=jnp.float32)
+            cmd_dim = min(cond_dim, cmd.shape[0])
+            cond_seq = cond_seq.at[:, :, :cmd_dim].set(cmd[None, None, :cmd_dim])
+            print(f"Using commands (first {cmd_dim} dims): {args.commands}")
+        if cond_norm_mean is not None and cond_norm_std is not None:
+            mean = jnp.asarray(cond_norm_mean).reshape((1, 1, -1))
+            std = jnp.clip(jnp.asarray(cond_norm_std).reshape((1, 1, -1)), a_min=1e-6)
+            cond_seq = (cond_seq - mean) / std
+   
     # Sample trajectories
     rng, sample_rng = random.split(rng)
     trajectories = sample_trajectory(
@@ -213,7 +235,7 @@ def main():
         params=params,
         rollout_op=rollout,
         x0=x0,
-        cond=cond,
+        cond_seq=cond_seq,
         n_steps=args.n_steps,
         rng=sample_rng,
     )
@@ -226,7 +248,11 @@ def main():
     np.savez(
         args.output,
         trajectories=np.array(trajectories),
-        cond=np.array(cond) if cond is not None else None,
+        cond=(
+            np.array(cond_seq)
+            if cond_seq is not None
+            else None
+        ),
     )
     print(f"\n✓ Saved to {args.output}")
     

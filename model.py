@@ -110,29 +110,30 @@ class ContinuousCondEmbedder(nnx.Module):
 
         has_time_axis = attr.ndim == 3
         if has_time_axis:
-            batch, seq_len, _ = attr.shape
-            attr_flat = attr.reshape((-1, self.attr_dim))
+            batch, seq_len, _ = attr.shape #(batch, seq_len, attr_dim)
+            attr_flat = attr.reshape((-1, self.attr_dim)) #(batch * seq_len, attr_dim) ?? does this even make sense?``
             mask_flat = None
             if mask is not None:
                 mask_flat = mask.reshape((-1, self.attr_dim))
         else:
-            batch = attr.shape[0]
+            batch = attr.shape[0] #(batch, attr_dim)
             seq_len = None
             attr_flat = attr
             mask_flat = mask
 
         emb = self.embed(attr_flat)
         emb = emb.reshape((-1, self.attr_dim, 128)) # (b, attr_dim, 128)
-
+        
         if mask_flat is not None:
             emb = emb * mask_flat[:, :, None]
 
         emb = self.attn(emb, deterministic=True, decode=False) # (b, attr_dim, 128)
         emb = emb.reshape((-1, self.attr_dim * 128)) 
         emb = self.out_proj(emb) # (b, hidden_size)
-
-        if has_time_axis:
-            emb = emb.reshape((batch, seq_len, self.hidden_size))
+        
+        # #TODO: should we do this reshaping? should the "conditioning vector" simply be concatenated with the expert trajectory \in R^{37}?
+        # if has_time_axis:
+        #     emb = emb.reshape((batch, seq_len, self.hidden_size))
 
         return emb
 
@@ -309,15 +310,15 @@ class DiT1d(nnx.Module):
             if attr_emb.ndim == 2:
                 # Global conditioning vector: fold into time embedding for adaLN.
                 t_emb = t_emb + attr_emb
-            else:
-                if attr_emb.shape[1] != seq_len:
-                    raise ValueError(
-                        f"Conditioning sequence length {attr_emb.shape[1]} "
-                        f"does not match token sequence length {seq_len}."
-                    )
-                # Per-token conditioning: add to token stream and summarize for adaLN.
-                x = x + attr_emb
-                t_emb = t_emb + jnp.mean(attr_emb, axis=1)
+            # else:
+            #     if attr_emb.shape[1] != seq_len:
+            #         raise ValueError(
+            #             f"Conditioning sequence length {attr_emb.shape[1]} "
+            #             f"does not match token sequence length {seq_len}."
+            #         )
+            #     # Per-token conditioning: add to token stream and summarize for adaLN.
+            #     x = x + attr_emb
+            #     t_emb = t_emb + jnp.mean(attr_emb, axis=1)
 
         for i in range(self.depth):
             block = getattr(self, f"block_{i}")
@@ -363,21 +364,17 @@ class ActionPredictor(nnx.Module):
         self,
         X_t: jnp.ndarray,
         t: jnp.ndarray,
-        cond: Optional[jnp.ndarray] = None,
-        mask: Optional[jnp.ndarray] = None,
         deterministic: bool = True,
     ) -> jnp.ndarray:
         """
         Args:
             X_t: Noisy state trajectory (batch, H+1, state_dim)
             t: Time (batch, 1)
-            cond: Optional conditioning (batch, cond_dim or batch, seq, cond_dim)
-            mask: Optional conditioning mask
             deterministic: Whether to apply dropout
         Returns:
             U_hat: Predicted actions (batch, H, action_dim)
         """
-        y = self.backbone(X_t, t, attr=cond, mask=mask, deterministic=deterministic)
+        y = self.backbone(X_t, t, deterministic=deterministic)
         a_tokens = self.action_head(y)
         a_tokens = jnp.tanh(a_tokens)
         U_hat = a_tokens[:, 1:, :]
@@ -445,8 +442,7 @@ def create_action_predictor(
     # Force materialization via a dummy call to ensure arrays are initialized.
     dummy_X_t = jnp.ones((1, horizon, state_dim))
     dummy_t = jnp.ones((1, 1))
-    dummy_cond = jnp.ones((1, cond_dim)) if cond_dim else None
-    _ = model_handle.apply(params, dummy_X_t, dummy_t, cond=dummy_cond, deterministic=True)
+    _ = model_handle.apply(params, dummy_X_t, dummy_t, deterministic=True)
 
     return model_handle, params
 
