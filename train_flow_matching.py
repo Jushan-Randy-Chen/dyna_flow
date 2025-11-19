@@ -51,7 +51,7 @@ def compute_normalization_stats(trajectories: jnp.ndarray) -> dict:
     # We compute mean/std over batch and time for non-quaternion dims and
     # set quaternion dims' mean=0, std=1 so they are left unchanged by z-score.
     # This preserves the unit-norm manifold structure of quaternions.
-    # trajectories = jnp.nan_to_num(trajectories, nan=0.0, posinf=0.0, neginf=0.0)
+
     D = trajectories.shape[-1]
     idx = jnp.arange(D)
     non_quat_mask = jnp.logical_or(idx < 3, idx >= 7)  # True for dims to normalize
@@ -60,8 +60,6 @@ def compute_normalization_stats(trajectories: jnp.ndarray) -> dict:
     sel = trajectories[..., non_quat_mask]
     mean_sel = jnp.mean(sel, axis=(0, 1))
     std_sel = jnp.std(sel, axis=(0, 1), ddof=0)
-    # mean_sel = jnp.nan_to_num(mean_sel, nan=0.0)
-    # std_sel = jnp.nan_to_num(std_sel, nan=1.0, posinf=1.0, neginf=1.0)
     std_sel = jnp.clip(std_sel, a_min=1e-6)
     
     # Build full mean/std arrays where quaternion dims have mean=0 and std=1
@@ -81,11 +79,9 @@ def compute_normalization_stats_cond(trajectories: jnp.ndarray) -> dict:
     Returns:
         Dictionary with 'mean' and 'std' arrays of shape (cond_dim,)
     """
-    # trajectories = jnp.nan_to_num(trajectories, nan=0.0, posinf=0.0, neginf=0.0)
     mean = jnp.mean(trajectories, axis=(0, 1))
     std = jnp.std(trajectories, axis=(0, 1), ddof=0)
-    # mean = jnp.nan_to_num(mean, nan=0.0)
-    # std = jnp.nan_to_num(std, nan=1.0, posinf=1.0, neginf=1.0)
+
     std = jnp.clip(std, a_min=1e-6)
     return {'mean': mean, 'std': std}
 
@@ -454,10 +450,6 @@ def main():
     print("\nComputing normalization statistics...")
     norm_stats = compute_normalization_stats(all_trajectories)
     
-    # print(f"✓ Normalization stats computed")
-    # print(f"  Mean: min={float(norm_stats['mean'].min()):.3f}, max={float(norm_stats['mean'].max()):.3f}")
-    # print(f"  Std:  min={float(norm_stats['std'].min()):.3f}, max={float(norm_stats['std'].max()):.3f}")
-
     # Conditioning normalization (if available)
     norm_stats_cond = None
     if all_conds is not None:
