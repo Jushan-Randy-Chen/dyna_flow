@@ -601,7 +601,7 @@ def main():
                 opt_state=opt_state,
                 optimizer=optimizer,
                 x1_demo=x1_demo,
-                cond=cond,
+                cond=None,
                 rng=step_rng,
                 norm_stats=norm_stats,
                 ema_params=ema_params,

@@ -238,29 +238,30 @@ def conditional_matching_loss(
     # sign = jnp.where(dot < 0.0, -1.0, 1.0)
     # q_hat_aligned = q_hat * sign
 
-    # # Build aligned prediction array for subtraction
+    # Build aligned prediction array for subtraction
     # X1_hat_aligned = X1_hat.at[..., 3:7].set(q_hat_aligned)
 
-    # # Compute quaternion angular error (scalar) and use it in the loss.
-    # # Align q_hat sign to q_demo to remove q ~ -q ambiguity (dot may be negative).
+    # Compute quaternion angular error (scalar) and use it in the loss.
+    # Align q_hat sign to q_demo to remove q ~ -q ambiguity (dot may be negative).
     # q_hat = X1_hat_aligned[..., 3:7]
     # q_demo = x1_demo[..., 3:7]
 
-    # # Ensure unit length (numerical safety)
+    # Ensure unit length (numerical safety)
     # q_hat = q_hat / jnp.linalg.norm(q_hat, axis=-1, keepdims=True).clip(min=1e-6)
     # q_demo = q_demo / jnp.linalg.norm(q_demo, axis=-1, keepdims=True).clip(min=1e-6)
     # dot = jnp.sum(q_hat * q_demo, axis=-1, keepdims=True)  # (batch, H+1, 1)
     # dot_clipped = jnp.clip(dot, -1.0, 1.0)
 
-    # # Avoid NaNs from arccos'(x) at |x| = 1 by contracting the range slightly.
+    # Avoid NaNs from arccos'(x) at |x| = 1 by contracting the range slightly.
     # dot_safe = jnp.clip(dot_clipped, a_min=-1.0 + 1e-4, a_max=1.0 - 1e-4)
     # angle = 2.0 * jnp.arccos(dot_safe)  # (batch, H+1, 1)
     # angle_sq = angle ** 2  # (batch, H+1, 1)
 
-    # # Prepare component-wise diff but zero quaternion components (we'll add angular term separately)
+    # Prepare component-wise diff but zero quaternion components (we'll add angular term separately)
     # diff = X1_hat_aligned - x1_demo
-    # diff_nonquat = diff.at[..., 3:7].set(0.0)
-    
+       # diff_nonquat = diff.at[..., 3:7].set(0.0)
+
+   
 
     # weighted_diff_sq_nonquat = weight_mask * (diff_nonquat ** 2)  # non-quaternion component of error
     # weight_mask_nonquat = weight_mask.at[..., 3:7].set(0.0)
@@ -295,9 +296,15 @@ def conditional_matching_loss(
     
 
 
+    """
+    Nov 17: just use the L2 loss on the generalized coordinates and velocities
+    
+    """
+
     diff = X1_hat - x1_demo
-    loss_numerator = weight_mask * diff**2
-    loss = loss_numerator.sum() / jnp.maximum(weight_mask.sum(), 1e-6)
+    loss_numerator = weight_mask * (diff **2)
+    loss = loss_numerator.sum() / weight_mask.sum()
+    
     # Auxiliary outputs for monitoring
     aux = {
         'x1_hat': X1_hat,
