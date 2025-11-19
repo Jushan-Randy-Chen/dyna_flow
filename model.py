@@ -1,11 +1,6 @@
 """
 JAX/Flax NNX implementation of the 1D Diffusion Transformer (DiT) for action prediction.
 
-This module builds the action prediction network D_θ that consumes a noisy state
-trajectory X_t, diffusion time t, and optional conditioning signal c, and returns
-the predicted action sequence Ũ. The architecture mirrors the DiT backbone from
-the DynaFlow paper but is written using the object-style Flax.nnx API that is also
-used throughout the `gpc` reference repository.
 """
 
 from __future__ import annotations
